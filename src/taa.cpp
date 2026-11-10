@@ -4,12 +4,14 @@
 #include <d3d12.h>
 #include <d3dcompiler.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 
 #include "config.h"
+#include "mvfix.h"
 #include "log.h"
 
 // TAA off (DisableTAA).
@@ -47,7 +49,11 @@ void main(uint3 id : SV_DispatchThreadID) {
     for (uint y = 0; y < by; ++y)
         for (uint x = 0; x < bx; ++x) {
             uint2 p = uint2(id.x * bx + x, id.y * by + y);
+#ifdef TAA_DEBUG
+            if (p.x < w && p.y < h) g_out[p] = float4(g_scene[p].r + 0.5, 0, g_scene[p].b + 0.5, 1);  // magenta tint
+#else
             if (p.x < w && p.y < h) g_out[p] = g_scene[p];
+#endif
         }
 }
 )";
@@ -82,7 +88,81 @@ float Lateral(uint b) {  // eye offset from the camera node along the camera's r
     float3 right = float3(c[b + 11].x, c[b + 12].x, c[b + 13].x);
     return dot(c[b + 38].xyz - c[b + 37].xyz, right);
 }
-#ifdef UPSCALER_VARIANT
+#ifdef DISOCC
+// Stereo edge fix (StereoEdgeFix, shared upscaler history: DlssGhostingFix off). The previous frame is the other eye,
+// so at every depth edge a strip of background was hidden behind the nearer object from the other eye's viewpoint;
+// the upscaler blends the wrong (occluder's) history there: the halo. Those pixels are found from depth alone: p was
+// hidden if a nearer pixel q on the same row lands on the same spot in the previous (other eye's) frame. Their motion
+// vector is pointed off screen, so the upscaler treats them as newly revealed and uses the current frame.
+float2 PrevNdc(float2 ndc, float d) {
+    float4 v = float4(ndc, d, 1.0);
+    float pw = dot(c[131], v);
+    return float2(dot(c[128], v), dot(c[129], v)) / (abs(pw) > 1e-6 ? pw : 1.0);
+}
+[numthreads(8, 8, 1)]
+void main(uint3 id : SV_DispatchThreadID) {
+    uint w, h;
+    g_out.GetDimensions(w, h);
+#if EDGE_MODE == 4
+    // dev: no checks at all, every texel of the thread's block (does anything downstream read this texture?)
+    {
+        uint gx4 = max(g_rows[30].z, 1u), gy4 = max(g_rows[30].w, 1u);
+        uint bx4 = clamp((w + gx4 * 8 - 1) / (gx4 * 8), 1u, 8u), by4 = clamp((h + gy4 * 8 - 1) / (gy4 * 8), 1u, 8u);
+        for (uint y = 0; y < by4; ++y)
+            for (uint x = 0; x < bx4; ++x) {
+                uint2 p = uint2(id.x * bx4 + x, id.y * by4 + y);
+                if (p.x < w && p.y < h) g_out[p] = float2(0.05, 0.0);
+            }
+        return;
+    }
+#endif
+    float ipd = 2.0 * length(c[38].xyz - c[37].xyz);
+    float3 right = float3(c[11].x, c[12].x, c[13].x);
+    float3 curPos = float3(c[11].w, c[12].w, c[13].w), prevPos = float3(c[75].w, c[76].w, c[77].w);
+    float side = dot(curPos - prevPos, right);
+    if (ipd < 0.005 || ipd > 2.0 || abs(side) < 0.5 * ipd || abs(side) > 1.5 * ipd) return;  // previous = other eye only
+    uint gx = max(g_rows[30].z, 1u), gy = max(g_rows[30].w, 1u);
+    uint bx = clamp((w + gx * 8 - 1) / (gx * 8), 1u, 8u), by = clamp((h + gy * 8 - 1) / (gy * 8), 1u, 8u);
+    float rs = asfloat(g_rows[6].x);
+    rs = (rs > 0.05 && rs <= 1.0) ? rs : 1.0;
+    float wS = w * rs, hS = h * rs;  // the rendered part of the textures
+    for (uint y = 0; y < by; ++y)
+        for (uint x = 0; x < bx; ++x) {
+            uint2 p = uint2(id.x * bx + x, id.y * by + y);
+            if (p.x >= (uint)wS || p.y >= (uint)hS) continue;
+            float dp = g_depth[p];
+            float2 ndcP = float2((p.x + 0.5) / wS * 2.0 - 1.0, 1.0 - (p.y + 0.5) / hS * 2.0);
+            float prevP = PrevNdc(ndcP, dp).x;
+            bool hidden = false;
+            [loop] for (int dir = -1; dir <= 1 && !hidden; dir += 2) {
+                // coarse look for anything nearer within the search range
+                bool near = false;
+                [loop] for (int k = 8; k <= EDGE_RANGE && !near; k += 8) {
+                    int qx = (int)p.x + dir * k;
+                    if (qx < 0 || qx >= (int)wS) break;
+                    near = g_depth[uint2(qx, p.y)] > dp * 1.02 + 1e-7;
+                }
+                if (!near) continue;
+                [loop] for (int k = 1; k <= EDGE_RANGE && !hidden; ++k) {
+                    int qx = (int)p.x + dir * k;
+                    if (qx < 0 || qx >= (int)wS) break;
+                    float dq = g_depth[uint2(qx, p.y)];
+                    if (!(dq > dp * 1.02 + 1e-7)) continue;
+                    float2 ndcQ = float2((qx + 0.5) / wS * 2.0 - 1.0, ndcP.y);
+                    float prevQ = PrevNdc(ndcQ, dq).x;
+                    hidden = abs(prevQ - prevP) * 0.5 * wS < 0.75;  // same spot in the other eye's frame (pixels)
+                }
+            }
+#if EDGE_MODE == 2
+            if (hidden) g_out[p] = float2(0.03, 0.0);  // dev: visible smear where the mask is
+#elif EDGE_MODE == 3
+            g_out[p] = float2(4.0, 4.0);  // dev: no history anywhere (does the upscaler react to off-screen vectors?)
+#else
+            if (hidden) g_out[p] = float2(4.0, 4.0);  // off screen: no history here
+#endif
+        }
+}
+#elif defined(UPSCALER_VARIANT)
 // Upscaler variant (run 196): the previous CameraParam (+0x400) is the other eye, and the resolve reprojects every
 // pixel (static and animated) with it, so the whole image carries the eye disparity as motion (+-10 px at 50 % FSR
 // with a 2 m scene). The error is exact: e = P00 * (lateral(cur) - lateral(prev)) / z in NDC, i.e. -e / 2 in uv x.
@@ -181,6 +261,9 @@ struct VelPair {
     ID3D12PipelineState* fix;
 };
 VelPair g_vel[16];
+ID3D12PipelineState* g_edge[16][4] = {};  // stereo edge fix pipelines per upscaler resolve: normal, dev 2, dev 3
+ID3DBlob* g_edgeCs[4] = {};
+std::atomic<long> g_edgePasses{0};
 std::atomic<int> g_nVel{0}, g_velFixes{0};
 
 ID3DBlob* g_cs = nullptr;
@@ -195,6 +278,7 @@ bool Tagged(ID3D12PipelineState* p, uint32_t kind) {
     return SUCCEEDED(p->GetPrivateData(kTagGuid, &size, &v)) && size == sizeof(v) && v == kind;
 }
 std::atomic<int> g_created{0}, g_swaps{0};
+std::atomic<long> g_taaRuns{0};
 
 struct Pair {
     ID3D12PipelineState* orig;
@@ -265,14 +349,45 @@ void NoteVelPso(ID3D12Device* dev, ID3D12RootSignature* rs, ID3D12PipelineState*
     }
     ReleaseSRWLockExclusive(&g_lock);
     Tag(orig, 2);
-    LOG("Per-eye character motion: game velocity resolve pipeline %p (%s, %s variant) -> fix pass %p", (void*)orig, how,
-        kind == 2 ? "upscaler" : "TAA", (void*)fix);
+    ID3D12PipelineState* edge = nullptr;
+    if (kind == 2) {  // StereoEdgeFix pipelines for the upscaler resolve
+        ID3D12PipelineState* e3[4] = {};
+        for (int m = 0; m < 4; ++m) {
+            if (!g_edgeCs[m]) {
+                const char* modes[4] = {"1", "2", "3", "4"};
+                const D3D_SHADER_MACRO dm[] = {{"UPSCALER_VARIANT", "1"}, {"DISOCC", "1"}, {"EDGE_RANGE", "128"},
+                                               {"EDGE_MODE", modes[m]}, {nullptr, nullptr}};
+                g_edgeCs[m] = Compile(kVelFixHlsl, "stereo_edge_fix", dm);
+            }
+            if (!g_edgeCs[m]) continue;
+            D3D12_COMPUTE_PIPELINE_STATE_DESC ed{};
+            ed.pRootSignature = rs;
+            ed.CS = {g_edgeCs[m]->GetBufferPointer(), g_edgeCs[m]->GetBufferSize()};
+            if (FAILED(dev->CreateComputePipelineState(&ed, IID_PPV_ARGS(&e3[m])))) e3[m] = nullptr;
+        }
+        edge = e3[0];
+        LOG("Stereo edge fix: pipelines %p %p %p %p", (void*)e3[0], (void*)e3[1], (void*)e3[2], (void*)e3[3]);
+        AcquireSRWLockExclusive(&g_lock);
+        for (int i = 0; i < g_nVel.load(); ++i)
+            if (g_vel[i].orig == orig)
+                for (int m = 0; m < 4; ++m) g_edge[i][m] = e3[m];
+        ReleaseSRWLockExclusive(&g_lock);
+    }
+    LOG("Per-eye character motion: game velocity resolve pipeline %p (%s, %s variant) -> fix pass %p, edge pass %p", (void*)orig,
+        how, kind == 2 ? "upscaler" : "TAA", (void*)fix, (void*)edge);
 }
 
-ID3D12PipelineState* VelFixFor(ID3D12PipelineState* p) {
+ID3D12PipelineState* VelFixFor(ID3D12PipelineState* p, ID3D12PipelineState** edge = nullptr) {
     const int n = g_nVel.load();
     for (int i = 0; i < n; ++i)
-        if (g_vel[i].orig == p) return Tagged(p, 2) ? g_vel[i].fix : nullptr;
+        if (g_vel[i].orig == p) {
+            if (!Tagged(p, 2)) return nullptr;
+            if (edge) {
+                const int m = std::clamp(vr::g_config.stereoEdgeFix, 1, 4) - 1;
+                *edge = g_edge[i][m];
+            }
+            return g_vel[i].fix;
+        }
     return nullptr;
 }
 
@@ -290,7 +405,10 @@ ID3DBlob* PassThroughCs() {
         return nullptr;
     }
     ID3DBlob* err = nullptr;
-    HRESULT hr = compile(kPassThroughHlsl, strlen(kPassThroughHlsl), "taa_off", nullptr, nullptr, "main", "cs_5_1",
+    // TaaDebug (dev): the replacement tints the image magenta, so a capture-free test shows whether the swapped pass
+    // reaches the screen
+    const D3D_SHADER_MACRO dbg[] = {{"TAA_DEBUG", "1"}, {nullptr, nullptr}};
+    HRESULT hr = compile(kPassThroughHlsl, strlen(kPassThroughHlsl), "taa_off", vr::g_config.taaDebug ? dbg : nullptr, nullptr, "main", "cs_5_1",
                          D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &g_cs, &err);
     if (FAILED(hr)) LOG("TAA: pass-through shader failed to compile 0x%08lX %s", hr, err ? (const char*)err->GetBufferPointer() : "");
     if (err) err->Release();
@@ -492,13 +610,22 @@ void NotePso(ID3D12Device* dev, ID3D12RootSignature* rs, ID3D12PipelineState* p,
 thread_local ID3D12GraphicsCommandList* t_cl = nullptr;
 thread_local ID3D12PipelineState* t_pso = nullptr;
 using Dispatch_t = void(STDMETHODCALLTYPE*)(ID3D12GraphicsCommandList*, UINT, UINT, UINT);
+struct ExtraHook { int slot; void* fn; };
+ExtraHook g_extra[16];
+int g_nExtra = 0;
 
 void STDMETHODCALLTYPE Hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y, UINT z) {
     auto dispatch = reinterpret_cast<Dispatch_t>(OrigFor(cl, 14));
     dispatch(cl, x, y, z);
-    if (t_cl != cl || !t_pso || !vr::g_config.perEyeObjectMotion || !g_nVel.load()) return;
-    ID3D12PipelineState* fix = VelFixFor(t_pso);
+    const bool objMotion = vr::g_config.perEyeObjectMotion && !mvfix::Wanted();  // MotionRebuild handles objects itself
+    // the in-resolve variant of the edge fix had no effect (the upscalers read other motion vectors): see stereo_edge.cpp
+    const bool edgeFix = false;
+    if (t_cl != cl || !t_pso || !(objMotion || edgeFix) || !g_nVel.load()) return;
+    ID3D12PipelineState* edge = nullptr;
+    ID3D12PipelineState* fix = VelFixFor(t_pso, &edge);
+    if (edgeFix) fix = edge;  // the shader itself does nothing unless the previous frame is the other eye
     if (!fix) return;
+    if (edgeFix && g_edgePasses++ == 0) LOG("Stereo edge fix: first pass (%u x %u groups)", x, y);
     // the fix reads and writes the resolve's output: UAV barriers around it; same root signature, so the game's
     // bindings (b0 camera, b1 frame, t0 / t1, u0) stay in place
     D3D12_RESOURCE_BARRIER b{};
@@ -515,18 +642,26 @@ void STDMETHODCALLTYPE Hk_Dispatch(ID3D12GraphicsCommandList* cl, UINT x, UINT y
 void STDMETHODCALLTYPE Hk_SetPso(ID3D12GraphicsCommandList* cl, ID3D12PipelineState* p) {
     t_cl = cl;
     t_pso = p;
-    if (vr::g_config.disableTaa && p && g_nPairs.load()) {
+    if (p && g_nPairs.load()) {
         if (ID3D12PipelineState* r = ReplacementFor(p)) {
-            p = r;
-            ++g_swaps;
+            ++g_taaRuns;  // the game's TAA is about to run (with DLSS / FSR it should not)
+            if (vr::g_config.disableTaa) {
+                p = r;
+                ++g_swaps;
+            }
         }
     }
     reinterpret_cast<SetPso_t>(OrigFor(cl, 25))(cl, p);
 }
 
+struct ExtraDev { int slot; void* fn; };
+ExtraDev g_extraDev[8];
+int g_nExtraDev = 0;
+
 void HookDevice(ID3D12Device* dev) {
     void** dvt = *reinterpret_cast<void***>(dev);
     Hook(dvt, 11, (void*)&Hk_CreateCompute);
+    for (int i = 0; i < g_nExtraDev; ++i) Hook(dvt, g_extraDev[i].slot, g_extraDev[i].fn);
     ID3D12Device1* d1 = nullptr;
     if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&d1))) && d1) {
         Hook(*reinterpret_cast<void***>(d1), 44, (void*)&Hk_CreateLibrary);
@@ -544,6 +679,7 @@ void HookDevice(ID3D12Device* dev) {
             SUCCEEDED(dev->CreateCommandList(0, type, alloc, nullptr, IID_PPV_ARGS(&list)))) {
             Hook(*reinterpret_cast<void***>(list), 25, (void*)&Hk_SetPso);
             Hook(*reinterpret_cast<void***>(list), 14, (void*)&Hk_Dispatch);
+            for (int i = 0; i < g_nExtra; ++i) Hook(*reinterpret_cast<void***>(list), g_extra[i].slot, g_extra[i].fn);
             list->Close();
         }
         if (list) list->Release();
@@ -557,6 +693,26 @@ void HookDevice(ID3D12Device* dev) {
 bool g_installed = false;
 
 }  // namespace
+
+void* OrigListFn(void* self, int slot) { return OrigFor(self, slot); }
+
+ID3D12PipelineState* CurrentPso(void* cl) { return t_cl == cl ? t_pso : nullptr; }
+
+void HookDeviceSlot(int slot, void* fn) {
+    if (g_nExtraDev < 8) g_extraDev[g_nExtraDev++] = {slot, fn};
+}
+
+void HookListSlot(int slot, void* fn) {
+    if (g_nExtra < 16) g_extra[g_nExtra++] = {slot, fn};
+    AcquireSRWLockShared(&g_hookLock);
+    void** vts[12];
+    const int n = g_nvt;
+    for (int i = 0; i < n; ++i) vts[i] = g_vts[i].vt;
+    ReleaseSRWLockShared(&g_hookLock);
+    // vtables already seen that are command lists (they have slot 14 hooked)
+    for (int i = 0; i < n; ++i)
+        if (vts[i][14] == (void*)&Hk_Dispatch) Hook(vts[i], slot, fn);
+}
 
 void OnDeviceCreated(ID3D12Device* dev) {
     if (!dev || g_installed) return;
@@ -584,9 +740,10 @@ void OnDeviceCreated(ID3D12Device* dev) {
 }
 
 const char* Status() {
-    static char buf[96];
-    snprintf(buf, sizeof(buf), "TAA %s (%d pipelines, %d swaps), character motion fix %d passes", vr::g_config.disableTaa ? "off" : "on",
-             g_nPairs.load(), g_swaps.load(), g_velFixes.load());
+    static char buf[192];
+    snprintf(buf, sizeof(buf), "TAA %s (%d pipelines, ran %ld times, %d swaps), character motion fix %d passes, stereo edge fix %ld passes",
+             vr::g_config.disableTaa ? "off" : "on", g_nPairs.load(), g_taaRuns.load(), g_swaps.load(), g_velFixes.load(),
+             g_edgePasses.load());
     return buf;
 }
 

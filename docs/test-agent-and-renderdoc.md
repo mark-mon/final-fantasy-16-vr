@@ -69,3 +69,15 @@ Earlier hypotheses that were wrong: not RAM (crashed on 32 GB too); not the NVAP
 ## Build
 
 Linux container: unzip `toolchain.zip`, LLVM 22.1.3 (`LLVM-22.1.3-Linux-X64.tar.xz`), `TOOLCHAIN=<dir> LLVM=<dir> ./build.sh`. Needs `third_party\openxr\include` next to `src\`.
+
+## Shared test agent (since 2026-11-03)
+The test PC now runs one agent for all projects (`D:\vrconversions\sharedtools\agent`, see its README.txt and
+`sharedtools\machine_test_sharing\README.txt`). The per-project FF16 agent is retired.
+- Commands: `D:\vrconversions\sharedtools\agent\inbox\ff16__<NNN_name>.cmd.ps1`; results in
+  `D:\vrconversions\ff16\agent\outbox\<NNN_name>.out.txt`. A machine lock serialises all projects.
+- Each command loads its own helpers: `. 'D:\vrconversions\ff16\agent\ff16shared.ps1'` (which loads ff16tools.ps1).
+- Pattern: `Enter-FF16Test -Source <build dir> -Config 'Key=Value', ...` then `try { ... } finally { Exit-FF16Test }`.
+  Enter installs the build, the OpenXR loader and `agent\test_config.txt`; Exit closes the game, keeps the log as
+  `agent\outbox\last_ff16vr.log`, copies the config back and removes every mod / test file from the game folder.
+- SteamVR stays on the null driver and keeps running: the old NullHmd on / off switching (and killing SteamVR
+  processes) must not be used any more. Steam stays offline.

@@ -30,13 +30,15 @@ struct UsedSample {
     float tanHalfV = 1, tanHalfH = 1;  // symmetric field of view the game rendered with
     uint64_t presentTag = 0;           // present count when the camera was updated
     int eye = -1;                      // -1 = mono (both eyes), 0 = left, 1 = right
+    uint32_t serial = 0;               // camera updates of this eye so far (pairs a render with its present: warp.cpp)
 };
 
 void PublishHead(const HeadSample& s);
 HeadSample LatestHead();
 
 // Camera hook: remember what a camera update used. Present: pick the update `lag` presents back.
-void RecordUsed(const UsedSample& s);
+void RecordUsed(const UsedSample& s);  // assigns s.serial
+uint32_t LatestSerial(int eye);        // serial of the latest camera update of that eye (0 none)
 bool UsedForPresent(uint64_t presentCount, int lag, UsedSample* out);
 uint64_t PresentCount();
 void CountPresent();

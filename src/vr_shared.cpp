@@ -23,10 +23,16 @@ HeadSample LatestHead() {
     return g_head;
 }
 
+uint32_t g_serial[2] = {};
 void RecordUsed(const UsedSample& s) {
     std::lock_guard<std::mutex> lock(g_mutex);
     g_used[g_usedNext] = s;
+    g_used[g_usedNext].serial = ++g_serial[s.eye >= 0 ? s.eye & 1 : 0];
     g_usedNext = (g_usedNext + 1) % kRing;
+}
+uint32_t LatestSerial(int eye) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_serial[eye & 1];
 }
 
 bool UsedForPresent(uint64_t presentCount, int lag, UsedSample* out) {

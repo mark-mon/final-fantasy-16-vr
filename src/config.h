@@ -29,10 +29,42 @@ struct Config {
 
     // Native: DLSS keeps a separate history for each eye (right eye on its own Streamline viewport)
     bool perEyeDlss = true;
+    // DLSS model preset forced on all quality modes: 0 = game / driver default, else sl::DLSSPreset (10 J, 11 K, 12 L, 13 M)
+    int dlssPreset = 0;
+    float lumaSharpen = 0.f;
+    float textureLodBias = 0.f;
+    bool taaDebug = false;
+    bool foveatedDlss = true;       // DLSS only on a centre rectangle of each eye (sharedtools foveated_dlss)
+    float foveatedDlssSize = 0.6f;  // centre size, fraction of the eye image
+    bool foveatedDlssTaa = true;    // periphery stabilised by the module's TAA (off: plain upscale of the render image)
+    bool stereoNoiseSync = false;  // both eyes of a tick use the same noise pattern index (part of DlssGhostingFix)
+    // shared upscaler history: no history at edges the other eye couldn't see (halo). 1 on; dev: 2 smear the mask,
+    // 3 no history anywhere
+    int stereoEdgeFix = 0;
+    // per-eye upscaler history: the motion vectors DLSS gets are rebuilt (mvfix.cpp): 0 off, 1 camera motion only,
+    // 2 + each eye's own object motion, 3 + the first pass's object motion for the second pass (default)
+    int motionRebuild = 3;
+    // dev (frame warp, warp.cpp): in Native stereo, 1 = the right eye shows its rebuild from the left eye (with the
+    // real right camera), to check the rebuild against what the game draws
+    int warpLab = 0;
+    // dev (test PC, fixed headset): simulated head motion added to the tracked pose, so paths that only matter when
+    // the head moves between frames get exercised. Amplitude in metres and degrees, period in seconds.
+    float devHeadSwayM = 0, devHeadSwayDeg = 0, devHeadSwayPeriod = 4;
+    bool devNoDlss = false;   // dev (test PC): report DLSS as unsupported to the game, so it falls back to FSR 3 (the
+                              // game's config.xml does not switch the upscaler by itself, run 312)
+    bool devCapture = false;  // dev: capture depth / motion vectors / camera per eye in plain Native (dumps with shots)
+    bool cinematicTheater = true;  // in-engine cinematics on the theater screen (cinematic.cpp)
+    // frame warp: around anything that moved, take the freshly drawn eye within this many depth-map texels (0 = off).
+    // The rebuilt eye's own image keeps a faint old outline there otherwise (DLSS softens edges).
+    int warpBand = 4;
+    int warpBackSign = 1;    // dev: camera column 2 is back (+1) or forward (-1)
+    bool warpMotion = false; // frame warp: move the other eye's held image by its own motion vectors (moving objects)
+    bool warpObjects = true; // frame warp: things that move (object part of the drawn eye's rebuilt motion vectors) come from
+                             // the drawn eye, not the rebuilt eye's tick-old own image (double characters, Nov 9)
 
     // Fixed foveated rendering (VRS Tier 2) in Mono / Native: full rate inside foveatedInner, 2x2 to foveatedMiddle,
     // foveatedOuterRate beyond (0 = 2x2, 1 = 4x4). Radii as a fraction of the image half height.
-    bool foveatedRendering = true;
+    bool foveatedRendering = false;  // off by default since 0.9.1: Foveated DLSS gains more and the two do not add up
     float foveatedInner = 0.5f;
     float foveatedMiddle = 0.8f;
     int foveatedOuterRate = 1;
@@ -72,9 +104,13 @@ struct Config {
     bool stereoJitterSync = true;
     // Per-eye DLSS: each eye\'s motion vectors against its own previous camera (cam_prev.cpp).
     bool perEyeMotionVectors = true;
+    // Per-eye history for the game's temporal effects: TAA, fog, half-res effects (eye_history.cpp).
+    bool perEyeEffectHistory = true;
+    // Per-eye FSR 3 history: the right eye gets its own FidelityFX upscale context (ffx_hooks.cpp).
+    bool perEyeFsr = true;
     // DlssGhostingFix: the one config / menu switch for the five per-eye fixes above (PerEyeDlss, PerEyeHistory,
     // PerEyeObjectMotion, StereoJitterSync, PerEyeMotionVectors); see ApplyDlssGhostingFix.
-    bool dlssGhostingFix = false;  // default off (user, Oct 29: slightly sharper image without it)
+    bool dlssGhostingFix = true;  // default on since the rebuilt motion vectors (Nov 9); off was sharper before (Oct 29)
     bool disableCinematicEffects = true;
     bool disableGraphicsDebuggerCheck = false;  // development only (RenderDoc / PIX); off for players
 
@@ -103,6 +139,7 @@ struct Config {
 
 extern Config g_config;
 void ApplyDlssGhostingFix();  // copy dlssGhostingFix to the five per-eye fields
+void ApplyFoveatedDlss();     // pass FoveatedDlss / FoveatedDlssSize to the foveated DLSS module
 extern std::wstring g_gameDir;
 
 // Loads <gameDir>\config.txt, writing a commented default file if missing.

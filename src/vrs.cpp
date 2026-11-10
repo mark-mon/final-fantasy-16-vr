@@ -376,6 +376,8 @@ void STDMETHODCALLTYPE Hk_RSSetViewports(ID3D12GraphicsCommandList* cl, UINT n, 
 
 }  // namespace
 
+bool GazeForCurrentEye(float vpAspect, float* gx, float* gy) { return GazeNdc(vpAspect, gx, gy); }
+
 void OnDevice(ID3D12Device* device, ID3D12CommandQueue* queue) {
     if (g_device || !device) return;
     g_device = device;

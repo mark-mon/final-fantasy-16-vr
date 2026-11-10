@@ -8,7 +8,9 @@
 #include "version.h"
 #include "config.h"
 #include "log.h"
+#include "lod_bias.h"
 #include "render_size.h"
+#include "sl_hooks.h"
 #include "vrs.h"
 #include "stereo_render.h"
 #include "vrkit_menu_d3d12.h"
@@ -21,12 +23,12 @@ namespace {
 vrkit::menu::Placement g_place;  // where the menu panel appears (World / Head anchor)
 std::string g_vrMode;  // "Flat" / "Mono" / "Native", mirrors g_config.vrMode
 
-const char* ModeName(int m) { return m == 2 ? "Native" : m == 1 ? "Mono" : "Flat"; }
+const char* ModeName(int m) { return m == 3 ? "Warp" : m == 2 ? "Native" : m == 1 ? "Mono" : "Flat"; }
 
 void ApplyMode() {
-    int m = g_vrMode == "Native" ? 2 : g_vrMode == "Mono" ? 1 : 0;
+    int m = g_vrMode == "Warp" ? 3 : g_vrMode == "Native" ? 2 : g_vrMode == "Mono" ? 1 : 0;
     vr::g_config.vrMode = m;
-    stereo_render::SetNativeMode(m == 2);
+    stereo_render::SetStereoMode(m);
     LOG("Menu: VRMode -> %s", ModeName(m));
 }
 
@@ -40,6 +42,11 @@ void Register() {
     g_vrMode = ModeName(c.vrMode);
 
     // ---- VR
+    // Frame warp (VRMode Warp) is not offered: it ghosts moving characters in the headset (eye pairing over time, Nov 10).
+    // The config value is still accepted (DevWarp) for development.
+    if (g_vrMode == "Warp") g_vrMode = "Native";
+    o.AddAction("VR", "Recenter view", [] { xr::RequestRecenter(); },
+                "Make the current head position the centre (same as F8).");
     auto& mode = o.AddChoice("VR", "VRMode", "VR mode", &g_vrMode, {"Flat", "Mono", "Native"},
                              "Flat: the game on a screen. Mono: head-tracked, same image in both eyes. "
                              "Native: each eye rendered separately in gameplay (about 2x GPU).",
@@ -48,30 +55,53 @@ void Register() {
     o.AddFloat("VR", "RenderScale", "Render resolution", &c.renderScale, 0.f, 2.f, 0.05f, 2,
                "Per-eye resolution in Mono / Native, relative to the headset's recommended size (1.00 = 100 %). "
                "Lower = faster, higher = sharper. 0 = keep the game's own resolution. Applied within a second.");
-    o.AddBool("VR", "PositionTracking", "Position tracking", &c.positionTracking,
-              "Head movement moves the camera (off: rotation only).");
+    // PositionTracking, PoseLatencyFrames and DisableMotionBlur are config.txt-only (always 1 / 1 / on in practice).
     o.AddFloat("VR", "WorldScale", "World scale", &c.worldScale, 0.1f, 10.f, 0.05f, 2,
                "Game units per meter of head movement and eye separation. Bigger = you feel smaller.");
-    o.AddInt("VR", "PoseLatencyFrames", "Pose latency (frames)", &c.poseLatencyFrames, 0, 4, 1,
-             "Frames between the game's camera update and the image shown. Wrong value: the world wobbles when "
-             "you turn; in Native the eyes may swap.");
     o.AddFloat("VR", "FovScale", "Field of view scale", &c.fovScale, 0.5f, 1.5f, 0.05f, 2,
                "Render a wider (or narrower) view than the headset's.");
-    o.AddBool("VR", "DlssGhostingFix", "DLSS ghosting fix", &c.dlssGhostingFix,
+    o.AddBool("VR", "DlssGhostingFixV2", "DLSS ghosting fix", &c.dlssGhostingFix,
               "Native: each eye gets its own DLSS history, camera history, motion vectors and jitter, and characters' "
               "motion is corrected. Removes the halo around characters and keeps DLSS sharp (also helps FSR / TAA).",
               [] {
                   vr::ApplyDlssGhostingFix();
                   LOG("Menu: DlssGhostingFix -> %d", (int)vr::g_config.dlssGhostingFix);
               });
-    o.AddBool("VR", "DisableMotionBlur", "Keep motion blur off", &c.disableMotionBlur,
-              "After loads the game turns its motion blur back on (blurry image in VR, the eye offset reads as motion). "
-              "This keeps it off by patching the game's blur strength every frame (falls back to a pause-menu round trip "
-              "if the game code is not found).");
-    o.AddAction("VR", "Recenter view", [] { xr::RequestRecenter(); },
-                "Make the current head position the centre (same as F8).");
+    // MotionRebuild (0..3) is part of the DLSS ghosting fix; it stays at 3 (config.txt / dev command mvmode for tests).
+    // StereoEdgeFix (stereo_edge.cpp) stays a config-only dev option: the halo is DLSS rejecting history at the
+    // edges (user test Nov 4: dropping more history changes nothing), not wrong history it could be told to drop.
+    static std::string s_preset;
+    s_preset = c.dlssPreset == 10 ? "J" : c.dlssPreset == 11 ? "K" : c.dlssPreset == 12 ? "L" : c.dlssPreset == 13 ? "M" : "Default";
+    auto& dp = o.AddChoice("VR", "DlssPreset", "DLSS model", &s_preset, {"Default", "K", "M", "L", "J"},
+                           "Which DLSS model to use. Default: the game's / driver's choice. K: transformer, best quality. "
+                           "M: transformer, faster. L: transformer for Ultra Performance. J: like K, a little less ghosting, "
+                           "more flicker. Needs a recent DLSS (310+); otherwise DLSS falls back to its default.",
+                           [] {
+                               vr::g_config.dlssPreset = s_preset == "J" ? 10 : s_preset == "K" ? 11 : s_preset == "L" ? 12
+                                                       : s_preset == "M" ? 13 : 0;
+                               sl_hooks::ReapplyDlssOptions();
+                           });
+    dp.choiceLabels = {"Game default", "K (transformer, quality)", "M (transformer, fast)", "L (ultra performance)", "J"};
+    // WarpEdgeBand (0..16) stays a config.txt / dev key: frame warp is not offered in the menu.
+    o.AddFloat("VR", "LumaSharpen", "Sharpening (LumaSharpen)", &c.lumaSharpen, 0.f, 5.f, 0.05f, 2,
+               "Sharpens the image in the headset (luma only, clamped so edges don't halo). 0 = off; anything above 0 "
+               "sharpens, never blurs. 0.65 is the LumaSharpen shader's original default, 1 to 1.5 suits DLSS Performance, "
+               "up to 5 (above 1 the edge limit grows too). Live.");
+    o.AddFloat("VR", "TextureLodBias", "Texture sharpness (LOD bias)", &c.textureLodBias, -2.f, 0.f, 0.05f, 2,
+               "Makes the game pick sharper texture mip levels (negative = sharper; -0.5 to -1 suits DLSS Performance). "
+               "Too low makes textures shimmer. Live for most textures; the rest after a restart.",
+               [] { lod_bias::Apply(); });
 
     // ---- Performance: fixed foveated rendering (VRS)
+    o.AddBool("Performance", "FoveatedDlss", "Foveated DLSS", &c.foveatedDlss,
+              "DLSS only on the centre of each eye (follows your eyes with eye tracking); the rest is the game's own image "
+              "with a light TAA. Large performance gain with DLSS. Live.",
+              [] { vr::ApplyFoveatedDlss(); });
+    o.AddFloat("Performance", "FoveatedDlssSize", "Foveated DLSS centre size", &c.foveatedDlssSize, 0.2f, 1.f, 0.05f, 2,
+               "Size of the DLSS centre as a fraction of each eye's image (smaller = faster).", [] { vr::ApplyFoveatedDlss(); });
+    o.AddBool("Performance", "FoveatedDlssTaa", "Foveated DLSS periphery TAA", &c.foveatedDlssTaa,
+              "Outside the DLSS centre: on = the render image upscaled and smoothed by a light TAA; off = plain upscale "
+              "(cheaper, more shimmer). Live.", [] { vr::ApplyFoveatedDlss(); });
     o.AddBool("Performance", "FoveatedRendering", "Foveated rendering", &c.foveatedRendering,
               "Shade the edges of each eye's image at a lower rate (variable rate shading). Live.");
     o.AddBool("Performance", "FoveatedGaze", "Follow eye tracking", &c.foveatedGaze,
@@ -122,6 +152,9 @@ void Register() {
     o.AddBool("Game", "DisableCinematicEffects", "Disable cinematic effects", &c.disableCinematicEffects,
               "Cutscene vignette, film grain and chromatic aberration.").needsRestart = true;
     o.AddBool("Game", "VerboseLog", "Verbose log", &c.verboseLog, "More detail in ff16vr.log.");
+    o.AddAction("Game", "Debug: capture 4 frames (in 5 s)", [] { xr::RequestShotBurst(5000); },
+                "Saves the next 4 frames sent to the headset as xrshot_N.bmp in the game folder, 5 seconds after you "
+                "press it: close the menu and hold still. For bug reports.");
 }
 
 }  // namespace

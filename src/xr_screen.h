@@ -16,6 +16,7 @@ void OnResizeBuffers(IDXGISwapChain* sc);
 
 // Recenter the view / screen at the next frame (menu action; same as the recenter key).
 void RequestRecenter();
+void RequestShotBurst(int delayMs);  // dev: save 4 consecutive submitted frames (xrshot_N.bmp in the game folder)
 // The HUD shows the opening cinematic's letterbox mask (opaque black middle, clear top / bottom rows): play that
 // stretch on the flat screen without the HUD panel (xr_screen.cpp ProbeResult).
 bool HudMovieMode();

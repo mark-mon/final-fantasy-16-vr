@@ -1,5 +1,9 @@
 #include "render_size.h"
 #include "cam_prev.h"
+#include "eye_history.h"
+#include "lod_bias.h"
+#include "fovdlss.h"
+#include "ffx_hooks.h"
 #include "motion_blur.h"
 #include "taa.h"
 #include "camera_hook.h"
@@ -15,6 +19,8 @@
 #include "patches.h"
 #include "stereo_render.h"
 #include "vrs.h"
+#include "warp.h"
+#include "mvfix.h"
 #include "xr_screen.h"
 
 #include <algorithm>
@@ -422,9 +428,10 @@ void OnPresent() {
         const Vram v = QueryVram();
         char vram[96] = "VRAM ?";
         if (v.ok) snprintf(vram, sizeof(vram), "VRAM %.2f / %.2f GB, %.2f GB in system memory", v.localUsed, v.localBudget, v.sharedUsed);
-        LOG("Perf: %.1f game presents/s, VR %u fps, render %d x %d, %s, VRS %s, %s, %s, %s | last 10 s: %ld ResizeBuffers, %ld window "
+        fovdlss::Report();
+        LOG("Perf: %.1f game presents/s, VR %u fps, render %d x %d, %s, VRS %s, %s, %s, %s, %s, %s, %s, %s, %s | last 10 s: %ld ResizeBuffers, %ld window "
             "resizes, %ld XR swapchain creates, %ld stereo switches", s_presents * 1000.f / (now - s_perfT0),
-            xr::VrFramesPerSecond(), cur.w, cur.h, vram, vrs::Status(), motion_blur::Status(), taa::Status(), cam_prev::Status(), rb, wr, xc, sw);
+            xr::VrFramesPerSecond(), cur.w, cur.h, vram, vrs::Status(), motion_blur::Status(), taa::Status(), cam_prev::Status(), eye_history::Status(), ffx_hooks::Status(), lod_bias::Status(), warp::Status(), mvfix::Status(), rb, wr, xc, sw);
         if (v.ok && v.localUsed > v.localBudget)
             LOG("WARNING: video memory over budget (%.2f of %.2f GB): lower RenderScale", v.localUsed, v.localBudget);
         if (xc >= 20 || sw >= 20)
@@ -449,8 +456,36 @@ void OnPresent() {
         if (fgets(line, sizeof(line), f)) {
             int mask = 0, vrsOn = 0, taaOff = 0;
             int peh = 0, pom = 0, jit = 0;
-            int pmv = 0;
-            if (sscanf(line, "pmv %d", &pmv) == 1) {  // dev: per-eye motion vectors 0 off / 1 auto / 2 always
+            int pmv = 0, peeh = 0;
+            float shp = 0.f;
+            int edge = 0;
+            if (sscanf(line, "noise %d", &edge) == 1) {  // dev: StereoNoiseSync
+                vr::g_config.stereoNoiseSync = edge != 0;
+                LOG("Resize trigger: StereoNoiseSync -> %d", edge != 0);
+                scale = -2.f;
+            } else if (sscanf(line, "edge %d", &edge) == 1) {  // dev: StereoEdgeFix
+                vr::g_config.stereoEdgeFix = edge;
+                LOG("Resize trigger: StereoEdgeFix -> %d", edge);
+                scale = -2.f;
+            } else if (sscanf(line, "lodbias %f", &shp) == 1) {  // dev: TextureLodBias
+                vr::g_config.textureLodBias = shp;
+                lod_bias::Apply();
+                scale = -2.f;
+            } else if (sscanf(line, "sharpen %f", &shp) == 1) {  // dev: LumaSharpen strength
+                vr::g_config.lumaSharpen = shp;
+                LOG("Resize trigger: LumaSharpen -> %.2f", shp);
+                scale = -2.f;
+            } else if (sscanf(line, "peehx %d", &peeh) == 1) {  // dev: textures copied twice per pass
+                eye_history::SetMultiMode(peeh);
+                scale = -2.f;
+            } else if (sscanf(line, "peehm %i", &peeh) == 1) {  // dev: per-eye effect history categories
+                eye_history::SetMask(peeh);
+                scale = -2.f;
+            } else if (sscanf(line, "peeh %d", &peeh) == 1) {  // dev: per-eye effect history on / off
+                vr::g_config.perEyeEffectHistory = peeh != 0;
+                LOG("Resize trigger: PerEyeEffectHistory -> %d", peeh != 0);
+                scale = -2.f;
+            } else if (sscanf(line, "pmv %d", &pmv) == 1) {  // dev: per-eye motion vectors 0 off / 1 auto / 2 always
                 cam_prev::SetMode(pmv);
                 scale = -2.f;
             } else if (sscanf(line, "jit %d", &jit) == 1) {  // dev: StereoJitterSync on / off

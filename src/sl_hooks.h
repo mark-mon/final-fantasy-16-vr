@@ -12,6 +12,7 @@ namespace sl_hooks {
 constexpr unsigned kRightEyeViewportOffset = 0x100;
 
 void Install();
-bool DlssEvaluatingRecently();  // per-eye DLSS evaluated within the last 0.5 s  // patch ffxvi.exe's GetProcAddress import (before the game initialises Streamline)
+bool DlssEvaluatingRecently();
+void ReapplyDlssOptions();       // DlssPreset changed: set the game's last DLSS options again (both eyes)  // per-eye DLSS evaluated within the last 0.5 s  // patch ffxvi.exe's GetProcAddress import (before the game initialises Streamline)
 
 }  // namespace sl_hooks

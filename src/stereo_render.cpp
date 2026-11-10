@@ -35,7 +35,10 @@ using Time_t = int64_t (*)();
 
 Frame_t g_frameFn = nullptr;
 Time_t g_timeFn = nullptr;
-std::atomic<int> g_mode{0};  // 0 normal, 1 Render() twice, 2 whole frame twice (game clock frozen for the 2nd)
+std::atomic<int> g_mode{0};  // 0 normal, 1 Render() twice, 2 whole frame twice (game clock frozen for the 2nd), 4 frame warp
+// Frame warp (VRMode Warp): one frame pass per tick, the eye alternating (left, right, left ...), the game clock running
+// normally; the eye not drawn is shown from its last image (and rebuilt from depth: warp.cpp).
+std::atomic<int> g_warpEye{0};
 bool g_freezeTime = false;
 std::atomic<bool> g_skip0{false};
 // Frame-twice only runs in gameplay (main camera updated recently). Boot logos, movies and menus stay single-frame:
@@ -55,6 +58,7 @@ std::atomic<long> g_toggles{0};  // switches between one and two frames per tick
 thread_local int t_pass = 0;
 std::atomic<int> g_viewCount{1};  // frame passes per tick: 1 or 2 (stereo)
 std::atomic<int> g_frameEye{-1};  // eye of the frame being rendered (any thread): -1 single frame, 0 left, 1 right
+std::atomic<int> g_passIndex{0};  // pass of the tick being rendered (any thread): 0 first, 1 second
 std::atomic<int> g_framesLogged{0};
 std::atomic<unsigned long> g_gameThread{0};
 SRWLOCK g_totLock = SRWLOCK_INIT;
@@ -125,7 +129,8 @@ extern "C" bool FrameHook(void* app) {
     const uint64_t last = g_lastMainView.load(std::memory_order_relaxed);
     const bool stableLongEnough = g_twiceNow.load(std::memory_order_relaxed) ||
                                   GetTickCount64() - g_mainViewRunStart.load(std::memory_order_relaxed) >= kMainViewStableMs;
-    const bool twice = g_mode.load(std::memory_order_relaxed) == 2 && last && n - last <= kMainViewWindow &&
+    const int mode = g_mode.load(std::memory_order_relaxed);
+    const bool twice = (mode == 2 || mode == 4) && last && n - last <= kMainViewWindow &&
                        g_mainViewRun.load(std::memory_order_relaxed) >= kMainViewStable && stableLongEnough &&
                        !xr::HudMovieMode();
     if (!g_gameplaySeen.load(std::memory_order_relaxed) && last && n - last <= kMainViewWindow &&
@@ -141,13 +146,21 @@ extern "C" bool FrameHook(void* app) {
             LOG("STEREO: %s (switch %ld)", twice ? "gameplay camera active: rendering both eyes" : "no gameplay camera: single frame",
                 (long)g_toggles);
     }
-    // Views per tick: 2 (left, right) in native stereo.
-    const int views = twice ? 2 : 1;
+    // Views per tick: 2 (left, right) in native stereo; 1 in frame warp (the eye alternates per tick).
+    const bool warp = twice && mode == 4;
+    const int views = twice && !warp ? 2 : 1;
     if (views != g_viewCount.load(std::memory_order_relaxed)) {
         if (views > 1) LOG("STEREO: %d views per tick", views);
         g_viewCount = views;
     }
-    g_frameEye = twice ? 0 : -1;
+    int eye0 = 0;
+    if (warp) {
+        eye0 = g_warpEye.load(std::memory_order_relaxed) ^ 1;
+        g_warpEye = eye0;
+        t_pass = eye0;
+    }
+    g_frameEye = twice ? eye0 : -1;
+    g_passIndex = 0;
     g_gameThread.store(GetCurrentThreadId(), std::memory_order_relaxed);
     camera_hook::OnFramePass();
     ULONG64 c0 = 0, c1 = 0;
@@ -156,9 +169,10 @@ extern "C" bool FrameHook(void* app) {
     bool r = g_frameFn(app);
     QueryThreadCycleTime(GetCurrentThread(), &c1);
     AddPass(twice ? 0 : 2, NowMs() - w0, c1 - c0);
-    for (int v = 1; twice && r && v < views; ++v) {
+    for (int v = 1; twice && !warp && r && v < views; ++v) {
         t_pass = v;
         g_frameEye = v;
+        g_passIndex = v;
         g_freezeTime = true;
         camera_hook::OnFramePass();
         QueryThreadCycleTime(GetCurrentThread(), &c0);
@@ -228,7 +242,16 @@ PassTotals TakePassTotals() {
     return t;
 }
 int FrameEye() { return g_frameEye.load(std::memory_order_relaxed); }
+int PassIndex() { return g_passIndex.load(std::memory_order_relaxed); }
 bool NativeActive() { return g_twiceNow.load(std::memory_order_relaxed); }
+bool WarpActive() { return g_twiceNow.load(std::memory_order_relaxed) && g_mode.load(std::memory_order_relaxed) == 4; }
+void SetStereoMode(int vrMode) {
+    if ((vrMode == 2 || vrMode == 3) && !(g_frameFn && g_timeFn)) return;
+    g_mode = vrMode == 2 ? 2 : vrMode == 3 ? 4 : 0;
+    g_twice = false;
+    g_skip0 = false;
+    LOG("STEREO: %s (menu)", vrMode == 2 ? "native stereo on" : vrMode == 3 ? "frame warp on" : "stereo off");
+}
 int ViewCount() { return g_viewCount.load(std::memory_order_relaxed); }
 
 void SetNativeMode(bool on) {
@@ -300,10 +323,11 @@ void Install() {
     }
     LOG("STEREO: frame hook %s, game clock hook %s (trigger 2 = whole frame twice)", g_frameFn ? "ok" : "MISSING",
         g_timeFn ? "ok" : "MISSING");
-    if (vr::g_config.vrMode == 2 && vr::g_config.vrOutput) {
+    if ((vr::g_config.vrMode == 2 || vr::g_config.vrMode == 3) && vr::g_config.vrOutput) {
         if (g_frameFn && g_timeFn) {
-            g_mode = 2;
-            LOG("STEREO: VRMode Native: each game tick renders two frames (left eye, then right eye)");
+            g_mode = vr::g_config.vrMode == 3 ? 4 : 2;
+            LOG(vr::g_config.vrMode == 3 ? "STEREO: VRMode Warp: one eye per game tick, alternating; the other eye is rebuilt"
+                                         : "STEREO: VRMode Native: each game tick renders two frames (left eye, then right eye)");
         } else {
             LOG("STEREO: VRMode Native needs the frame hooks; running Mono");
         }

@@ -14,6 +14,7 @@
 #include <string>
 
 #include "cam_prev.h"
+#include "cinematic.h"
 #include "config.h"
 #include "xr_screen.h"
 #include "log.h"
@@ -92,7 +93,8 @@ constexpr int kViewCallOffset = 14;
 bool IsMainView(const uint8_t* view) {
     const float nearZ = *reinterpret_cast<const float*>(view + 0xE44);
     const float farZ = *reinterpret_cast<const float*>(view + 0xE48);
-    return nearZ > 0.1f && nearZ < 0.5f && farZ < 10.f;
+    // In-engine cinematics can render through this view; they go to the theater screen (cinematic.cpp).
+    return nearZ > 0.1f && nearZ < 0.5f && farZ < 10.f && !cinematic::Active();
 }
 
 std::atomic<uint64_t> g_hmdUpdates{0};
@@ -384,8 +386,71 @@ long HistoryRestores() { return g_historyRestores.load(); }
 void* MainView() { return g_mainView.load(); }
 unsigned long long PassSerial() { return g_jitPassSerial; }
 
+// ---- Same noise pattern index for both eyes of a tick (StereoNoiseSync, part of DlssGhostingFix) ----
+// The frame-constant builder (ffxvi.exe+0xAF4088) takes row 14 .z of the frame constants from a frame clock:
+// (clock+0x38) & 63, the index the game's noise patterns (dithering of AO / reflections / shadows / fog) follow. The
+// clocks sit at [G + 0x40 + i*8] (i < 4), G = the global read at +0xAF4100. The index advances on every frame pass,
+// so in native stereo the left eye only gets the even patterns and the right eye the odd ones (RenderDoc 6499 / 6500:
+// 5 -> 6 between the eyes): with per-eye history the noise of each eye does not average out. Like the jitter, the
+// right eye's pass gets the left eye's index back, so each eye walks the whole sequence.
+uint8_t** g_clockRoot = nullptr;
+uint32_t g_noiseLeft[4] = {};
+bool g_noiseHave = false;
+long g_noiseSyncs = 0, g_noiseLogs = 0;
+
+uint8_t* Clock(int i) {
+    if (!g_clockRoot) return nullptr;
+    uint8_t* g = *g_clockRoot;
+    if (!g) return nullptr;
+    uint8_t* c = *reinterpret_cast<uint8_t**>(g + 0x40 + i * 8);
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!c || !VirtualQuery(c + 0x38, &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT || (mbi.Protect & 0xFF) != PAGE_READWRITE)
+        return nullptr;
+    return c;
+}
+
+void SyncNoise() {
+    if (!g_clockRoot) return;
+    const int pass = stereo_render::CurrentPass();
+    if (g_noiseLogs < 8 && stereo_render::NativeActive()) {
+        ++g_noiseLogs;
+        uint8_t* c = Clock(0);
+        LOG("Noise sync: pass %d clock0 index %u (sync %s)", pass, c ? *reinterpret_cast<uint32_t*>(c + 0x38) : 0u,
+            vr::g_config.stereoNoiseSync ? "on" : "off");
+    }
+    if (!vr::g_config.stereoNoiseSync || !stereo_render::NativeActive()) {
+        g_noiseHave = false;
+        return;
+    }
+    if (pass == 0) {
+        for (int i = 0; i < 4; ++i)
+            if (uint8_t* c = Clock(i)) g_noiseLeft[i] = *reinterpret_cast<uint32_t*>(c + 0x38);
+        g_noiseHave = true;
+    } else if (g_noiseHave) {
+        for (int i = 0; i < 4; ++i)
+            if (uint8_t* c = Clock(i)) *reinterpret_cast<uint32_t*>(c + 0x38) = g_noiseLeft[i];
+        if (g_noiseSyncs++ == 0) LOG("Noise sync: right eye pass uses the left eye's noise index");
+    }
+}
+
+void InstallNoiseSync() {
+    int count = 0;
+    // mov rsi, [rip+X]; xor r12d, r12d; mov r15, rcx; mov [rbp+0xB8], rcx (frame-constant builder, +0xAF4100)
+    uint8_t* p = patches::FindCode("48 8B 35 ?? ?? ?? ?? 45 33 E4 4C 8B F9 48 89 8D B8 00 00 00", &count);
+    if (!p) {
+        LOG("Noise sync: frame clock reference not found (%d matches)", count);
+        return;
+    }
+    int32_t rel;
+    memcpy(&rel, p + 3, 4);
+    g_clockRoot = reinterpret_cast<uint8_t**>(p + 7 + rel);
+    LOG("Noise sync: frame clocks at %p (ffxvi.exe+0x%zX)", (void*)g_clockRoot,
+        (size_t)(reinterpret_cast<uint8_t*>(g_clockRoot) - reinterpret_cast<uint8_t*>(GetModuleHandleW(nullptr))));
+}
+
 void OnFramePass() {
     ++g_jitPassSerial;
+    SyncNoise();
     SaveEyeSnap(stereo_render::CurrentPass());
     const DWORD now = GetTickCount();
     if (!g_seqLeft && now - g_seqPoll > 1000) {
@@ -506,6 +571,7 @@ DWORD WINAPI ControlThread(LPVOID) {
 }  // namespace
 
 void Install() {
+    InstallNoiseSync();
     int count = 0;
     uint8_t* sig = patches::FindCode(kCallSite, &count);
     if (!sig) {

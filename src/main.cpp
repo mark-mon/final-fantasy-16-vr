@@ -16,7 +16,14 @@
 #include "exit_trace.h"
 #include "cam_probe.h"
 #include "cam_prev.h"
+#include "eye_history.h"
+#include "lod_bias.h"
+#include "stereo_edge.h"
+#include "fovdlss.h"
+#include "MinHook.h"
+#include "ffx_hooks.h"
 #include "camera_hook.h"
+#include "cinematic.h"
 #include "stereo_render.h"
 #include "render_size.h"
 #include "motion_blur.h"
@@ -124,6 +131,19 @@ static DWORD WINAPI InitThread(LPVOID) {
     patches::ApplyGamePatches();
     camera_hook::Install();  // camera source hook (test offset via F9 / ff16vr_camtest.trigger)
     stereo_render::Install();  // native stereo (frame twice per tick) + Render() timing
+    ffx_hooks::Install();      // FidelityFX (FSR 3): right eye on its own upscale context (per-eye history)
+    eye_history::Install();    // per-eye history for the game's temporal effects (copy hooks)
+    lod_bias::Install();       // TextureLodBias: extra mip bias on the game's texture samplers
+    stereo_edge::Install();    // StereoEdgeFix: command-list state hooks for the pass before the upscaler
+    // Foveated DLSS (sharedtools\foveated_dlss): hooks _nvngx.dll's D3D12 DLSS entry points once it loads
+    const MH_STATUS mh = MH_Initialize();
+    if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) {
+        fovdlss::Install();
+        vr::ApplyFoveatedDlss();
+    } else {
+        LOG("Foveated DLSS: MinHook init failed (%d)", (int)mh);
+    }
+    if (mh == MH_OK || mh == MH_ERROR_ALREADY_INITIALIZED) cinematic::Install();  // in-engine cinematics -> theater screen
     cam_prev::Install();       // per-eye previous camera in the GPU camera constants (per-eye DLSS)
     sl_hooks::Install();       // Streamline (DLSS): right eye on its own viewport (per-eye history)
     motion_blur::Start();      // DisableMotionBlur: menu round trip after loads when the game left motion blur on

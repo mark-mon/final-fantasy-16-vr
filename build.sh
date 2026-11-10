@@ -29,7 +29,7 @@ VFS="$PWD/$OUT/vfs.yaml"
 CFLAGS=(--target=x86_64-pc-windows-msvc /std:c++20 /EHsc /O2 /MT /Zi /W3 /DNOMINMAX /DWIN32_LEAN_AND_MEAN /DUNICODE /D_UNICODE
         -Xclang -ivfsoverlay -Xclang "$VFS"
         /imsvc"$TOOLCHAIN/include" /imsvc"$TOOLCHAIN/Include/$SDK/ucrt" /imsvc"$TOOLCHAIN/Include/$SDK/um"
-        /imsvc"$TOOLCHAIN/Include/$SDK/shared" /Ithird_party/openxr/include
+        /imsvc"$TOOLCHAIN/Include/$SDK/shared" /Ithird_party/openxr/include /Ithird_party/minhook/include
         /Ivrkit /Ivrkit/third_party/imgui /DVRKIT_IAT_HOOKS
         -Wno-unused-command-line-argument -Wno-microsoft-cast)
 
@@ -37,6 +37,14 @@ OBJS=()
 for src in src/*.cpp vrkit/*.cpp; do
   obj="$OUT/$(basename "${src%.cpp}").obj"
   "$LLVM/bin/clang-cl" "${CFLAGS[@]}" /c "$src" /Fo"$obj"
+  OBJS+=("$obj")
+done
+# MinHook (third party, for the shared foveated DLSS module): compiled once
+mkdir -p "$OUT/minhook"
+for src in third_party/minhook/src/buffer.c third_party/minhook/src/hook.c third_party/minhook/src/trampoline.c \
+           third_party/minhook/src/hde/hde64.c; do
+  obj="$OUT/minhook/$(basename "${src%.c}").obj"
+  [ -f "$obj" ] || "$LLVM/bin/clang-cl" "${CFLAGS[@]}" /W0 /c "$src" /Fo"$obj"
   OBJS+=("$obj")
 done
 # Dear ImGui (third party): compiled once, rebuilt only when missing

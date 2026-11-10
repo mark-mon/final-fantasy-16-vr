@@ -11,7 +11,10 @@ void Install();
 int CurrentPass();        // view of this frame pass: 0 left, 1 right
 int ViewCount();          // frame passes per tick: 1 or 2
 int FrameEye();           // view of the frame being rendered, from any thread: -1 single frame, 0..3 (eye = view & 1)
-bool NativeActive();      // both eyes are being rendered this tick (gameplay camera active)
+int PassIndex();          // pass of the tick being rendered (game thread's state): 0 first, 1 second
+bool NativeActive();      // stereo eyes are being rendered (gameplay camera active): Native or Warp
+bool WarpActive();        // frame warp: one eye per tick, alternating (CurrentPass / FrameEye = that eye)
+void SetStereoMode(int vrMode);  // 0 flat, 1 mono, 2 native, 3 warp (menu)
 void SetNativeMode(bool on);  // VRMode switched at run time (menu)
 void NoteMainView();      // camera hook: the gameplay camera was updated this frame
 long ModeSwitches();      // switches between one and two frames per tick so far

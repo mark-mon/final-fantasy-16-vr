@@ -25,12 +25,15 @@
 #include <mutex>
 #include <string>
 #include <algorithm>
+#include <map>
 #include <vector>
 
 #include "config.h"
 #include "log.h"
 #include "vr_shared.h"
 #include "stereo_render.h"
+#include "warp.h"
+#include "cinematic.h"
 #include "menu_options.h"
 #include "hud_layer.h"
 #include "vrkit_menu_d3d12.h"
@@ -151,6 +154,11 @@ UINT64 g_fenceValue = 0;
 HANDLE g_fenceEvent = nullptr;
 
 ID3D12Resource* g_inter = nullptr;  // copy of the game's backbuffer
+// Frame warp: each eye's last image (a copy of g_inter when that eye was drawn), SRVs in g_srvHeap slots 1 and 2
+ID3D12Resource* g_held[2] = {};
+bool g_heldValid[2] = {};
+ID3D12Resource* g_rebuiltSrv = nullptr;  // frame warp: the image in SRV slot 3
+UINT g_srvInc = 0;
 DXGI_FORMAT g_interFmt = DXGI_FORMAT_UNKNOWN;
 UINT64 g_interW = 0;
 UINT g_interH = 0;
@@ -566,7 +574,7 @@ void PollEvents() {
 const char* kBlitHlsl = R"(
 Texture2D src : register(t0);
 SamplerState samp : register(s0);
-cbuffer Params : register(b0) { uint mode; };
+cbuffer Params : register(b0) { uint mode; float sharpen; float2 texel; };
 struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };
 VSOut VSMain(uint id : SV_VertexID) {
     VSOut o;
@@ -577,8 +585,23 @@ VSOut VSMain(uint id : SV_VertexID) {
 }
 float3 SrgbToLinear(float3 c) { return c <= 0.04045 ? c / 12.92 : pow((c + 0.055) / 1.055, 2.4); }
 float3 LinearToSrgb(float3 c) { return c <= 0.0031308 ? c * 12.92 : 1.055 * pow(c, 1.0 / 2.4) - 0.055; }
+// LumaSharpen (CeeJay.dk, "normal" pattern): sharpens the luma only, the difference to a 4-tap blur, clamped.
+float3 LumaSharpen(float3 ori, float2 uv) {
+    float2 d = texel * 0.5;
+    float3 blur = src.SampleLevel(samp, uv + float2(d.x, -d.y), 0).rgb + src.SampleLevel(samp, uv - float2(d.x, -d.y), 0).rgb +
+                  src.SampleLevel(samp, uv + d, 0).rgb + src.SampleLevel(samp, uv - d, 0).rgb;
+    blur *= 0.25;
+    // classic limit 0.035 up to strength 1; above that the limit grows with the strength (so 2..5 still add detail)
+    const float sharpClamp = 0.035 * max(1.0, sharpen);
+    float3 sharp = ori - blur;
+    float3 strengthLuma = float3(0.2126, 0.7152, 0.0722) * sharpen * (0.5 / sharpClamp);
+    float sharpLuma = saturate(dot(sharp, strengthLuma) + 0.5);
+    sharpLuma = (sharpClamp * 2.0) * sharpLuma - sharpClamp;
+    return ori + sharpLuma;
+}
 float4 PSMain(VSOut i) : SV_Target {
     float3 c = saturate(src.SampleLevel(samp, i.uv, 0).rgb);
+    if (sharpen > 0) c = saturate(LumaSharpen(c, i.uv));
     if (mode == 1) c = SrgbToLinear(c);
     if (mode == 2) c = LinearToSrgb(c);
     return float4(c, 1);
@@ -624,7 +647,7 @@ bool EnsureGpuResources() {
     params[0].DescriptorTable.pDescriptorRanges = &range;
     params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    params[1].Constants.Num32BitValues = 1;
+    params[1].Constants.Num32BitValues = 4;  // mode, sharpen, texel size
     params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
     D3D12_STATIC_SAMPLER_DESC ss{};
     ss.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
@@ -645,8 +668,10 @@ bool EnsureGpuResources() {
     SafeRelease(blob);
     if (FAILED(hr)) return false;
 
-    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
+    // slot 0 the game's image, 1 and 2 the held eye images (frame warp), 3 the rebuilt eye (frame warp)
+    D3D12_DESCRIPTOR_HEAP_DESC hd{D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4, D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE, 0};
     if (FAILED(g_device->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g_srvHeap)))) return false;
+    g_srvInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     g_rtvInc = g_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 
     for (int i = 0; i < kFrames; ++i)
@@ -702,6 +727,9 @@ bool EnsureIntermediate(const D3D12_RESOURCE_DESC& bb) {
     if (g_inter && g_interFmt == bb.Format && g_interW == bb.Width && g_interH == bb.Height) return true;
     WaitGpuIdle();
     SafeRelease(g_inter);
+    for (auto*& h : g_held) SafeRelease(h);
+    g_heldValid[0] = g_heldValid[1] = false;
+    g_rebuiltSrv = nullptr;
 
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     D3D12_RESOURCE_DESC rd{};
@@ -830,7 +858,51 @@ void ReleaseGpuResources() {
 // ---------------------------------------------------------------------------
 // Per-frame work
 // ---------------------------------------------------------------------------
-void RecordAndSubmit(ID3D12Resource* backbuffer, uint32_t imageIndex, uint32_t layer = 0) {
+// Frame warp: the held images (same size and format as g_inter), created on first use.
+bool EnsureHeld() {
+    if (g_held[0] && g_held[1]) return true;
+    if (!g_inter) return false;
+    const D3D12_RESOURCE_DESC rd = g_inter->GetDesc();
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    for (int e = 0; e < 2; ++e) {
+        if (FAILED(g_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                                                     nullptr, IID_PPV_ARGS(&g_held[e])))) {
+            LOG("ERROR: frame warp: held image %d failed", e);
+            return false;
+        }
+        g_held[e]->SetName(e ? L"ff16vr held right" : L"ff16vr held left");
+        D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+        sd.Format = TypedFormat(rd.Format);
+        sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sd.Texture2D.MipLevels = 1;
+        D3D12_CPU_DESCRIPTOR_HANDLE h = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
+        h.ptr += (SIZE_T)(1 + e) * g_srvInc;
+        g_device->CreateShaderResourceView(g_held[e], &sd, h);
+        g_heldValid[e] = false;
+    }
+    LOG("Frame warp: held eye images %llu x %u", (unsigned long long)rd.Width, rd.Height);
+    return true;
+}
+
+// Frame warp: the rebuilt eye image (warp.cpp) in SRV slot 3; recreated views when it changes.
+void SetRebuiltSrv(ID3D12Resource* r) {
+    if (r == g_rebuiltSrv) return;
+    g_rebuiltSrv = r;
+    D3D12_SHADER_RESOURCE_VIEW_DESC sd{};
+    sd.Format = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    sd.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sd.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sd.Texture2D.MipLevels = 1;
+    D3D12_CPU_DESCRIPTOR_HANDLE h = g_srvHeap->GetCPUDescriptorHandleForHeapStart();
+    h.ptr += 3 * (SIZE_T)g_srvInc;
+    g_device->CreateShaderResourceView(r, &sd, h);
+}
+
+// backbuffer: the game's image (copied to g_inter and drawn). nullptr: draw the held image of eye `heldEye` instead
+// (heldEye 2: the rebuilt eye image, same colour encoding as the game's image).
+// saveEye >= 0: also keep a copy of g_inter as that eye's held image (frame warp).
+void RecordAndSubmit(ID3D12Resource* backbuffer, uint32_t imageIndex, uint32_t layer = 0, int saveEye = -1, int heldEye = -1) {
     const uint32_t x0 = 0, w = g_xrW;
     int f = g_frameIdx;
     g_frameIdx = (g_frameIdx + 1) % kFrames;
@@ -841,15 +913,28 @@ void RecordAndSubmit(ID3D12Resource* backbuffer, uint32_t imageIndex, uint32_t l
     g_alloc[f]->Reset();
     g_list->Reset(g_alloc[f], g_pso);
 
-    D3D12_RESOURCE_BARRIER pre[2] = {
-        Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
-        Transition(g_inter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
-    g_list->ResourceBarrier(2, pre);
-    g_list->CopyResource(g_inter, backbuffer);
-    D3D12_RESOURCE_BARRIER post[2] = {
-        Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
-        Transition(g_inter, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
-    g_list->ResourceBarrier(2, post);
+    if (backbuffer) {
+        D3D12_RESOURCE_BARRIER pre[2] = {
+            Transition(backbuffer, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE),
+            Transition(g_inter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+        g_list->ResourceBarrier(2, pre);
+        g_list->CopyResource(g_inter, backbuffer);
+        D3D12_RESOURCE_BARRIER post[2] = {
+            Transition(backbuffer, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PRESENT),
+            Transition(g_inter, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+        g_list->ResourceBarrier(2, post);
+        if (saveEye >= 0 && saveEye < 2 && g_held[saveEye]) {
+            D3D12_RESOURCE_BARRIER a[2] = {
+                Transition(g_inter, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                Transition(g_held[saveEye], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST)};
+            g_list->ResourceBarrier(2, a);
+            g_list->CopyResource(g_held[saveEye], g_inter);
+            D3D12_RESOURCE_BARRIER b[2] = {
+                Transition(g_inter, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
+                Transition(g_held[saveEye], D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)};
+            g_list->ResourceBarrier(2, b);
+        }
+    }
 
     // OpenXR D3D12 colour images are in RENDER_TARGET state while acquired.
     UINT mode = 0;
@@ -862,7 +947,12 @@ void RecordAndSubmit(ID3D12Resource* backbuffer, uint32_t imageIndex, uint32_t l
                                     (SIZE_T)(imageIndex * g_xrLayers + (std::min)(layer, g_xrLayers - 1)) * g_rtvInc};
     g_list->SetGraphicsRootSignature(g_rootSig);
     g_list->SetDescriptorHeaps(1, &g_srvHeap);
-    g_list->SetGraphicsRootDescriptorTable(0, g_srvHeap->GetGPUDescriptorHandleForHeapStart());
+    D3D12_GPU_DESCRIPTOR_HANDLE srcTable = g_srvHeap->GetGPUDescriptorHandleForHeapStart();
+    if (!backbuffer && heldEye >= 0 && heldEye <= 2) srcTable.ptr += (UINT64)(1 + heldEye) * g_srvInc;
+    g_list->SetGraphicsRootDescriptorTable(0, srcTable);
+    const float sharpen = (std::max)(0.f, vr::g_config.lumaSharpen);
+    const float consts[4] = {0, sharpen, 1.f / (float)(std::max)((UINT64)1, g_interW), 1.f / (float)(std::max)(1u, g_interH)};
+    g_list->SetGraphicsRoot32BitConstants(1, 4, consts, 0);
     g_list->SetGraphicsRoot32BitConstant(1, mode, 0);
     g_list->OMSetRenderTargets(1, &rtv, FALSE, nullptr);
     D3D12_VIEWPORT vp{(float)x0, 0, (float)w, (float)g_xrH, 0, 1};
@@ -957,7 +1047,25 @@ void PublishHeadSample(XrTime time) {
     } else {
         h.tanLeft = h.tanRight = h.tanUp = h.tanDown = 1.0f;  // 90 degrees if the runtime gives no views
     }
-    const XrPosef& P = loc.pose;
+    XrPosef P = loc.pose;
+    if (const auto& c = vr::g_config; c.devHeadSwayM > 0 || c.devHeadSwayDeg > 0) {  // dev: simulated head motion
+        const double t = (double)time * 1e-9, w = 6.283185307 / (c.devHeadSwayPeriod > 0.1f ? c.devHeadSwayPeriod : 4.f);
+        P.position.x += c.devHeadSwayM * (float)sin(w * t);
+        P.position.y += 0.5f * c.devHeadSwayM * (float)sin(w * t * 0.7 + 1.0);
+        P.position.z += 0.3f * c.devHeadSwayM * (float)cos(w * t * 0.5);
+        const float yaw = c.devHeadSwayDeg * 0.01745329f * (float)sin(w * t * 0.8 + 0.5);
+        const float pitch = 0.5f * c.devHeadSwayDeg * 0.01745329f * (float)sin(w * t * 1.3);
+        const float qy[4] = {0, sinf(yaw / 2), 0, cosf(yaw / 2)}, qx[4] = {sinf(pitch / 2), 0, 0, cosf(pitch / 2)};
+        float q0[4] = {P.orientation.x, P.orientation.y, P.orientation.z, P.orientation.w}, q1[4], q2[4];
+        vrs::QuatMul(qy, qx, q1);
+        vrs::QuatMul(q1, q0, q2);
+        P.orientation = {q2[0], q2[1], q2[2], q2[3]};
+        static bool s_logged = false;
+        if (!s_logged) {
+            s_logged = true;
+            LOG("Dev: simulated head sway %.3f m, %.1f deg, period %.1f s", c.devHeadSwayM, c.devHeadSwayDeg, c.devHeadSwayPeriod);
+        }
+    }
     h.abs.q[0] = P.orientation.x; h.abs.q[1] = P.orientation.y; h.abs.q[2] = P.orientation.z; h.abs.q[3] = P.orientation.w;
     h.abs.p[0] = P.position.x; h.abs.p[1] = P.position.y; h.abs.p[2] = P.position.z;
     float inv[4];
@@ -987,7 +1095,8 @@ bool g_menuReady = false;
 bool g_menuFailed = false;
 bool g_menuVisible = false;
 bool g_menuShot = false;      // xrshot taken this frame: also save the menu image
-void SaveXrImage(ID3D12Resource* img, UINT slice = 0);
+void SaveXrImage(ID3D12Resource* img, UINT slice = 0, D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_RENDER_TARGET,
+                 const wchar_t* tag = nullptr);
 XrCompositionLayerQuad g_menuQuad{XR_TYPE_COMPOSITION_LAYER_QUAD};
 uint64_t g_xrFramesThisSecond = 0, g_xrFps = 0;
 ULONGLONG g_xrFpsTick = 0;
@@ -1368,18 +1477,43 @@ const XrCompositionLayerBaseHeader* HudFrame(bool onScreen, float screenW, float
 // Dev: <game>\ff16vr_xrshot.trigger saves the next submitted OpenXR image (both eyes) as xrshot_N.bmp (half size).
 int g_xrShotCount = 0;
 
+// The trigger may hold a number: a burst of that many consecutive frames (dev: frame warp, drawn vs rebuilt eye).
+int g_shotBurst = 0;
+std::atomic<ULONGLONG> g_shotAt{0};  // menu button: a burst due at this tick count
+bool XrShotPending() {  // a shot will be taken at the end of this frame (not consumed)
+    if (g_shotBurst > 0) return true;
+    if (const ULONGLONG at = g_shotAt.load(); at && GetTickCount64() >= at) return true;
+    return GetFileAttributesW((vr::g_gameDir + L"\\ff16vr_xrshot.trigger").c_str()) != INVALID_FILE_ATTRIBUTES;
+}
 bool XrShotRequested() {
+    if (const ULONGLONG at = g_shotAt.load(); at && GetTickCount64() >= at) {
+        g_shotAt = 0;
+        g_shotBurst = 4;
+        LOG("XR shot: burst of 4 from the menu button");
+    }
+    if (g_shotBurst > 0) {
+        --g_shotBurst;
+        return true;
+    }
     static ULONGLONG next = 0;
     ULONGLONG now = GetTickCount64();
     if (now < next) return false;
     next = now + 250;
     const std::wstring trig = vr::g_gameDir + L"\\ff16vr_xrshot.trigger";
     if (GetFileAttributesW(trig.c_str()) == INVALID_FILE_ATTRIBUTES) return false;
+    int n = 1;
+    if (FILE* f = _wfopen(trig.c_str(), L"r")) {
+        if (fscanf_s(f, "%d", &n) != 1) n = 1;
+        fclose(f);
+    }
     DeleteFileW(trig.c_str());
+    g_shotBurst = std::clamp(n, 1, 8) - 1;
     return true;
 }
 
-void SaveXrImage(ID3D12Resource* img, UINT slice) {
+std::map<std::wstring, int> g_tagShotCount;
+bool g_shotThisFrame = false;  // the lab already consumed this frame's shot request
+void SaveXrImage(ID3D12Resource* img, UINT slice, D3D12_RESOURCE_STATES state, const wchar_t* tag) {
     D3D12_RESOURCE_DESC d = img->GetDesc();
     D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
     UINT64 total = 0;
@@ -1406,14 +1540,14 @@ void SaveXrImage(ID3D12Resource* img, UINT slice) {
     }
     g_alloc[f]->Reset();
     g_list->Reset(g_alloc[f], nullptr);
-    auto b0 = Transition(img, D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    auto b0 = Transition(img, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
     g_list->ResourceBarrier(1, &b0);
     D3D12_TEXTURE_COPY_LOCATION dst{rb, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
     dst.PlacedFootprint = fp;
     D3D12_TEXTURE_COPY_LOCATION src{img, D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     src.SubresourceIndex = slice;  // one mip: subresource = array slice
     g_list->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    auto b1 = Transition(img, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    auto b1 = Transition(img, D3D12_RESOURCE_STATE_COPY_SOURCE, state);
     g_list->ResourceBarrier(1, &b1);
     g_list->Close();
     ID3D12CommandList* lists[] = {g_list};
@@ -1446,11 +1580,12 @@ void SaveXrImage(ID3D12Resource* img, UINT slice) {
             }
         }
         rb->Unmap(0, nullptr);
-        const std::wstring path = vr::g_gameDir + L"\\xrshot_" + std::to_wstring(++g_xrShotCount) + L".bmp";
+        const int n = tag && *tag ? ++g_tagShotCount[tag] : ++g_xrShotCount;
+        const std::wstring path = vr::g_gameDir + L"\\xrshot_" + (tag ? tag : L"") + std::to_wstring(n) + L".bmp";
         if (FILE* fo = _wfopen(path.c_str(), L"wb")) {
             fwrite(bmp.data(), 1, bmp.size(), fo);
             fclose(fo);
-            LOG("XR shot saved: xrshot_%d.bmp (%u x %u, format %d)", g_xrShotCount, W, H, (int)d.Format);
+            LOG("XR shot saved: xrshot_%ls%d.bmp (%u x %u, format %d)", tag ? tag : L"", n, W, H, (int)d.Format);
         }
     }
     rb->Release();
@@ -1472,6 +1607,8 @@ struct NativeFrame {
                                                  {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 };
 NativeFrame g_nf;
+XrCompositionLayerProjectionView g_heldView[2] = {{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},
+                                                  {XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
 uint64_t g_nativeFrames = 0;
 uint64_t g_eyeMismatch = 0;
 
@@ -1492,6 +1629,7 @@ void CloseNativeFrameEmpty() {
 
 void NativePresent(ID3D12Resource* bb, uint32_t eyeW, uint32_t eyeH) {
     NativeFrame& nf = g_nf;
+    warp::Poll();
     // Which eye is in this backbuffer? The camera sample it was rendered with says so. The engine presents with a
     // pipeline delay of PoseLatencyFrames (1: the image presented on pass 1 was rendered by pass 0, the left eye),
     // so without a fresh sample (menus: no main-view camera update) the eye follows from the pass parity.
@@ -1505,8 +1643,10 @@ void NativePresent(ID3D12Resource* bb, uint32_t eyeW, uint32_t eyeH) {
     if (fresh && used.eye != parityEye) ++g_eyeMismatch;
 
     // An OpenXR frame holds one game tick: left eye first, then right. Views without an open frame
-    // are dropped.
-    if (!nf.open && eye != 0) {
+    // are dropped. Frame warp: every present is a frame of its own (one eye drawn, the other held).
+    const bool warp = stereo_render::WarpActive() && EnsureHeld();
+    bool haveUsedDone = false;
+    if (!nf.open && eye != 0 && !warp) {
         vrs::CountPresent();
         return;
     }
@@ -1533,8 +1673,52 @@ void NativePresent(ID3D12Resource* bb, uint32_t eyeW, uint32_t eyeH) {
         }
     }
 
-    if (nf.acquired && haveUsed) {
-        RecordAndSubmit(bb, nf.idx, (uint32_t)eye);
+    // Warp lab (dev, Native stereo): the right eye shows its rebuild from the left eye, with the real right camera.
+    const bool labOn = !warp && vr::g_config.warpLab && stereo_render::NativeActive() && EnsureHeld();
+    if (nf.acquired && haveUsed && labOn && eye == 1 && g_heldValid[0]) {
+        // lab 1: the real right camera; lab 2: the left camera moved by the eye separation, as frame warp does;
+        // lab 3: frame warp's exact configuration (also the right eye's own image of the previous tick), against the
+        // real right eye drawn this tick (saved as xrshot_real_N.bmp with each shot).
+        const int lab = vr::g_config.warpLab;
+        float off[3] = {0, 0, 0};
+        const bool viaSep = lab >= 2;
+        if (viaSep) {
+            const vrs::HeadSample head = vrs::LatestHead();
+            if (head.valid)
+                for (int i = 0; i < 3; ++i) off[i] = (head.eye[1].p[i] - head.eye[0].p[i]) * vr::g_config.worldScale;
+        }
+        const bool own = lab == 3 && g_heldValid[1];
+        warp::BeginPresent(1, fresh ? used.serial : 0);
+        const bool shot = XrShotRequested();
+        g_shotThisFrame = g_shotThisFrame || shot;
+        if (shot) warp::RequestDump(1);  // this tick's right-eye depth, written with the rebuild
+        if (ID3D12Resource* rebuilt = warp::Rebuild(0, g_held[0], own ? g_held[1] : nullptr, own, TypedFormat(g_interFmt), off, !viaSep)) {
+            SetRebuiltSrv(rebuilt);
+            RecordAndSubmit(bb, nf.idx, 1, lab == 3 ? 1 : -1);  // the real right eye (lab 3: also held for the next tick)
+            if (lab == 3) {
+                warp::Hold(1);
+                g_heldValid[1] = true;
+            }
+            if (shot) SaveXrImage(g_xrImages[nf.idx].texture, 1, D3D12_RESOURCE_STATE_RENDER_TARGET, L"real_");
+            RecordAndSubmit(nullptr, nf.idx, 1, -1, 2);
+            if (shot) SaveXrImage(g_xrImages[nf.idx].texture, 1, D3D12_RESOURCE_STATE_RENDER_TARGET, L"reb_");
+            XrCompositionLayerProjectionView& pv = nf.views[1];
+            pv.pose.orientation = {used.abs.q[0], used.abs.q[1], used.abs.q[2], used.abs.q[3]};
+            pv.pose.position = {used.abs.p[0], used.abs.p[1], used.abs.p[2]};
+            pv.fov.angleLeft = -atanf(used.tanHalfH);
+            pv.fov.angleRight = atanf(used.tanHalfH);
+            pv.fov.angleUp = atanf(used.tanHalfV);
+            pv.fov.angleDown = -atanf(used.tanHalfV);
+            pv.subImage.swapchain = g_xrSwap;
+            pv.subImage.imageRect = {{0, 0}, {(int32_t)eyeW, (int32_t)eyeH}};
+            pv.subImage.imageArrayIndex = 1;
+            nf.filled |= 2;
+            haveUsedDone = true;
+        }
+    }
+    if (nf.acquired && haveUsed && !haveUsedDone) {
+        if (!warp && !labOn && vr::g_config.devCapture) warp::BeginPresent(eye, 0);  // dev dumps in plain Native
+        RecordAndSubmit(bb, nf.idx, (uint32_t)eye, warp ? eye : labOn && eye == 0 ? 0 : -1);
         XrCompositionLayerProjectionView& pv = nf.views[eye];
         pv.pose.orientation = {used.abs.q[0], used.abs.q[1], used.abs.q[2], used.abs.q[3]};
         pv.pose.position = {used.abs.p[0], used.abs.p[1], used.abs.p[2]};
@@ -1546,14 +1730,64 @@ void NativePresent(ID3D12Resource* bb, uint32_t eyeW, uint32_t eyeH) {
         pv.subImage.imageRect = {{0, 0}, {(int32_t)eyeW, (int32_t)eyeH}};
         pv.subImage.imageArrayIndex = (uint32_t)eye;
         nf.filled |= 1 << eye;
+        if (warp) {
+            const int other = eye ^ 1;
+            // The other eye of this tick: rebuilt from this image and depth, plus its own last image (warp.cpp), at
+            // this pose moved by the eye separation. Without a rebuild: its last image, at the pose it was drawn with
+            // (the compositor turns it).
+            const vrs::HeadSample head = vrs::LatestHead();
+            float sep[3] = {0, 0, 0};  // other eye - this eye, head space (meters)
+            if (head.valid)
+                for (int i = 0; i < 3; ++i) sep[i] = head.eye[other].p[i] - head.eye[eye].p[i];
+            const float ws = vr::g_config.worldScale;
+            const float camOff[3] = {sep[0] * ws, sep[1] * ws, sep[2] * ws};
+            warp::BeginPresent(eye, fresh ? used.serial : 0);
+            ID3D12Resource* rebuilt = head.valid ? warp::Rebuild(eye, g_inter, g_held[other], g_heldValid[other],
+                                                                 TypedFormat(g_interFmt), camOff, false)
+                                                 : nullptr;
+            warp::Hold(eye);
+            if (rebuilt) {
+                SetRebuiltSrv(rebuilt);
+                RecordAndSubmit(nullptr, nf.idx, (uint32_t)other, -1, 2);
+                XrCompositionLayerProjectionView ov = pv;
+                float R[3][3];
+                vrs::QuatToMat3(used.abs.q, R);
+                // world offset = R * sep (R column-vector rotation, as camera_hook)
+                ov.pose.position.x += R[0][0] * sep[0] + R[0][1] * sep[1] + R[0][2] * sep[2];
+                ov.pose.position.y += R[1][0] * sep[0] + R[1][1] * sep[1] + R[1][2] * sep[2];
+                ov.pose.position.z += R[2][0] * sep[0] + R[2][1] * sep[1] + R[2][2] * sep[2];
+                ov.subImage.imageArrayIndex = (uint32_t)other;
+                nf.views[other] = ov;
+                nf.filled |= 1 << other;
+            } else if (g_heldValid[other]) {
+                RecordAndSubmit(nullptr, nf.idx, (uint32_t)other, -1, other);
+                nf.views[other] = g_heldView[other];
+                nf.views[other].subImage.imageArrayIndex = (uint32_t)other;
+                nf.filled |= 1 << other;
+            }
+            g_heldView[eye] = pv;
+            g_heldValid[eye] = true;
+        } else if (labOn && eye == 0) {  // warp lab: keep the left eye (image, depth, camera) for the right one
+            warp::BeginPresent(0, fresh ? used.serial : 0);
+            warp::Hold(0);
+            g_heldValid[0] = true;
+        }
     }
     vrs::CountPresent();
     ++nf.presents;
+    if (warp) nf.presents = nViews;  // frame warp: this frame is complete
     const int all = (1 << nViews) - 1;
     if (nf.presents < nViews && nf.filled != all) return;
 
     // End the OpenXR frame.
-    if (nf.acquired && nf.filled && XrShotRequested()) {
+    const bool takeShot = g_shotThisFrame || XrShotRequested();
+    g_shotThisFrame = false;
+    if (nf.acquired && nf.filled && takeShot) {
+        if (!warp && !labOn && vr::g_config.devCapture) {
+            warp::DumpNow(0);
+            warp::DumpNow(1);
+        }
+        if (warp) LOG("XR shot: frame warp, eye %d drawn, eye %d rebuilt", eye, eye ^ 1);
         SaveXrImage(g_xrImages[nf.idx].texture);
         SaveXrImage(g_xrImages[nf.idx].texture, 1);  // right eye
         g_menuShot = true;
@@ -1628,6 +1862,7 @@ void OnSwapChainCreated(IDXGISwapChain* sc, ID3D12CommandQueue* queue) {
             return;
         }
     }
+    warp::Init(g_device, g_queue);  // frame warp: the rebuild runs on the game's queue
     g_gameSwap = sc;
     LOG("Tracking swap chain %p (device %p, queue %p)", sc, g_device, g_queue);
 }
@@ -1681,7 +1916,7 @@ void OnPresent(IDXGISwapChain* sc) {
         bb->Release();
         return;
     }
-    const bool native = vr::g_config.vrMode == 2 && stereo_render::NativeActive();
+    const bool native = (vr::g_config.vrMode == 2 || vr::g_config.vrMode == 3) && stereo_render::NativeActive();
     if (!EnsureIntermediate(bd) ||
         !EnsureXrSwapchain((uint32_t)bd.Width, bd.Height, native ? 2u : 1)) {
         bb->Release();
@@ -1805,6 +2040,8 @@ void OnPresent(IDXGISwapChain* sc) {
                 quad.subImage.imageArrayIndex = 0;
                 quad.pose = g_screenPose;
                 quad.size = {width, width * (float)bd.Height / (float)bd.Width};
+                // Movies fill the whole (headset-shaped) image, stretched; shown at 16:9 they look right (user, 2026-11-08).
+                if (cinematic::Active()) quad.size.height = width * 9.f / 16.f;
                 layers[0] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&quad);
                 layerCount = 1;
                 }
@@ -1836,6 +2073,10 @@ void OnPresent(IDXGISwapChain* sc) {
 bool HudMovieMode() { return g_hudMovie.load(); }
 
 void RequestRecenter() { g_needRecenter = true; }
+void RequestShotBurst(int delayMs) {
+    g_shotAt = GetTickCount64() + (ULONGLONG)delayMs;
+    LOG("XR shot: burst requested from the menu (in %d ms)", delayMs);
+}
 unsigned VrFramesPerSecond() { return (unsigned)g_xrFps; }
 void RecommendedEyeSize(unsigned* w, unsigned* h) { *w = g_recW; *h = g_recH; }
 bool HeadsetEyeTangents(float out[2][4]) {

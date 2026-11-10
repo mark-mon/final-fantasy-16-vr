@@ -1,4 +1,5 @@
 #include "config.h"
+#include "fovdlss.h"
 #include "log.h"
 
 #include <windows.h>
@@ -43,12 +44,28 @@ static const char* kDefaultConfig =
     "RenderScale = 1.0\n"
     "RenderWidth = 0\n"
     "RenderHeight = 0\n"
-    "# Native: DLSS ghosting fix (per-eye DLSS history, per-eye camera history and motion vectors, same jitter for\n"
-    "# both eyes, character motion fix). Removes the halo around characters and keeps DLSS sharp. 1 = on\n"
-    "DlssGhostingFix = 0\n"
+    "# Native: ghosting fix for DLSS and FSR 3 (per-eye upscaler history, per-eye camera history and motion vectors,\n"
+    "# same jitter for both eyes, motion vectors rebuilt by the mod). Removes the halo around characters and the\n"
+    "# one-eye noise when moving the head. 1 = on (default since 0.9.2; the old DlssGhostingFix key is ignored).\n"
+    "DlssGhostingFixV2 = 1\n"
+    "# DLSS model: Default (the game's / driver's choice), K (transformer, best quality), M (transformer, faster),\n"
+    "# L (transformer, for Ultra Performance), J\n"
+    "DlssPreset = Default\n"
+    "# Sharpening (LumaSharpen) of the image in the headset: 0 = off, higher = sharper (never blurs); 0.65 is the\n"
+    "# shader's original default, 1 to 1.5 suits DLSS Performance, max 5\n"
+    "LumaSharpen = 0\n"
+    "# Texture sharpness: extra mip LOD bias on the game's textures (negative = sharper, e.g. -0.5; too low shimmers)\n"
+    "TextureLodBias = 0\n"
+    "# Foveated DLSS: DLSS only on the centre of each eye (follows eye tracking with FoveatedGaze), the rest is the\n"
+    "# game's image with a light TAA. Big performance gain with DLSS. Size = centre as a fraction of the eye image.\n"
+    "FoveatedDlss = 1\n"
+    "FoveatedDlssSize = 0.6\n"
+    "# Foveated DLSS periphery: 1 = smoothed by a light TAA, 0 = plain upscale of the render image (cheaper)\n"
+    "FoveatedDlssTaa = 1\n"
     "# Fixed foveated rendering (variable rate shading) in Mono / Native: full detail in the middle, coarser shading\n"
-    "# towards the edges. Radii as a fraction of the half height; outer rate 2x2 or 4x4.\n"
-    "FoveatedRendering = 1\n"
+    "# towards the edges. Radii as a fraction of the half height; outer rate 2x2 or 4x4. Off by default (Foveated DLSS\n"
+    "# gains more; both together gain little extra).\n"
+    "FoveatedRendering = 0\n"
     "FoveatedInner = 0.5\n"
     "FoveatedMiddle = 0.8\n"
     "FoveatedOuterRate = 4x4\n"
@@ -141,7 +158,16 @@ static std::wstring Widen(const std::string& s) {
 void ApplyDlssGhostingFix() {
     const bool on = g_config.dlssGhostingFix;
     g_config.perEyeDlss = g_config.perEyeHistory = g_config.perEyeObjectMotion = g_config.stereoJitterSync =
-        g_config.perEyeMotionVectors = on;
+        g_config.perEyeMotionVectors = g_config.perEyeEffectHistory = g_config.perEyeFsr = g_config.stereoNoiseSync = on;
+}
+
+void ApplyFoveatedDlss() {
+    fovdlss::Config c;
+    c.enabled = g_config.foveatedDlss;
+    c.width = c.height = g_config.foveatedDlssSize;
+    c.periphDlss = false;  // a 2nd DLSS pass for the periphery costs as much as it saves (DLSS 310)
+    c.periphTaa = g_config.foveatedDlssTaa;
+    fovdlss::SetConfig(c);
 }
 
 void LoadConfig() {
@@ -157,6 +183,7 @@ void LoadConfig() {
 
     std::string line;
     int lineNo = 0;
+    int devEffectHistory = -1, devFsr = -1, devNoise = -1, devObjMotion = -1;
     while (std::getline(in, line)) {
         ++lineNo;
         line = Trim(line);
@@ -182,10 +209,40 @@ void LoadConfig() {
         else if (key == "disablemotionblur" || key == "blurrendermenufix") c.disableMotionBlur = ParseBool(val);
         else if (key == "blurmenufixholdms") c.blurMenuFixHoldMs = std::clamp(atoi(val.c_str()) / 10 * 10, 10, 1000);
         else if (key == "disabletaa") c.disableTaa = ParseBool(val);
-        else if (key == "dlssghostingfix") c.dlssGhostingFix = ParseBool(val);
+        else if (key == "taadebug") c.taaDebug = ParseBool(val);
+        else if (key == "foveateddlss") c.foveatedDlss = ParseBool(val);
+        else if (key == "foveateddlsstaa") c.foveatedDlssTaa = ParseBool(val);
+        else if (key == "foveateddlsssize") c.foveatedDlssSize = std::clamp((float)atof(val.c_str()), 0.2f, 1.0f);
+        else if (key == "stereoedgefix") {
+            std::string l = val;
+            for (auto& ch : l) ch = (char)tolower((unsigned char)ch);
+            c.stereoEdgeFix = l == "on" ? 1 : l == "test" ? 4 : l == "test2" ? 3 : l == "off" ? 0 : atoi(val.c_str());
+        }
+        else if (key == "warplab") c.warpLab = atoi(val.c_str());
+        else if (key == "motionrebuild") {
+            const std::string l = Lower(val);
+            c.motionRebuild = l == "on" ? 3 : l == "off" ? 0 : std::clamp(atoi(val.c_str()), 0, 3);
+        }
+        else if (key == "devcapture") c.devCapture = ParseBool(val);
+        else if (key == "devnodlss") c.devNoDlss = ParseBool(val);
+        else if (key == "devheadsway") sscanf_s(val.c_str(), "%f,%f,%f", &c.devHeadSwayM, &c.devHeadSwayDeg, &c.devHeadSwayPeriod);
+        else if (key == "cinematictheater") c.cinematicTheater = ParseBool(val);
+        else if (key == "warpobjects") c.warpObjects = ParseBool(val);
+        else if (key == "warpedgeband") c.warpBand = std::clamp(atoi(val.c_str()), 0, 16);
+        else if (key == "warpbacksign") c.warpBackSign = atoi(val.c_str()) < 0 ? -1 : 1;
+        else if (key == "warpmotion") c.warpMotion = ParseBool(val);
+        else if (key == "dlssghostingfixv2") c.dlssGhostingFix = ParseBool(val);
+        else if (key == "dlssghostingfix") LOG("config.txt:%d: DlssGhostingFix (0.9.0) is ignored; the fix is on by default, DlssGhostingFixV2 = 0 turns it off", lineNo);
+        else if (key == "dlsspreset") {
+            const std::string l = Lower(val);
+            c.dlssPreset = l == "j" ? 10 : l == "k" ? 11 : l == "l" ? 12 : l == "m" ? 13 : 0;
+        }
         // the five parts of DlssGhostingFix (older config files): accepted, set from DlssGhostingFix
-        else if (key == "pereyehistory" || key == "pereyeobjectmotion" || key == "stereojittersync" ||
-                 key == "pereyemotionvectors" || key == "pereyedlss") {}
+        else if (key == "pereyeeffecthistory") devEffectHistory = ParseBool(val);  // dev: overrides DlssGhostingFix
+        else if (key == "pereyefsr") devFsr = ParseBool(val);
+        else if (key == "stereonoisesync") devNoise = ParseBool(val);  // dev: overrides DlssGhostingFix                      // dev: overrides DlssGhostingFix
+        else if (key == "pereyeobjectmotion") devObjMotion = ParseBool(val);  // dev: overrides DlssGhostingFix
+        else if (key == "pereyehistory" || key == "stereojittersync" || key == "pereyemotionvectors" || key == "pereyedlss") {}
         else if (key == "disablecinematiceffects") c.disableCinematicEffects = ParseBool(val);
         else if (key == "disablegraphicsdebuggercheck") c.disableGraphicsDebuggerCheck = ParseBool(val);
         else if (key == "verboselog") c.verboseLog = ParseBool(val);
@@ -199,12 +256,16 @@ void LoadConfig() {
             if (m == "flat" || m == "0") c.vrMode = 0;
             else if (m == "mono" || m == "1") c.vrMode = 1;
             else if (m == "native" || m == "2") c.vrMode = 2;
+            else if (m == "devwarp") c.vrMode = 3;  // frame warp: development only (ghosts moving characters, Nov 10)
+            else if (m == "warp" || m == "3") { c.vrMode = 2; LOG("config.txt:%d: VRMode Warp is not available in this release; using Native", lineNo); }
             else LOG("config.txt:%d: VRMode '%s' unknown (Flat, Mono, Native); using Flat", lineNo, val.c_str());
         }
         else if (key == "positiontracking") c.positionTracking = ParseBool(val);
         else if (key == "worldscale") c.worldScale = std::clamp((float)atof(val.c_str()), 0.01f, 100.0f);
         else if (key == "poselatencyframes") c.poseLatencyFrames = std::clamp(atoi(val.c_str()), 0, 4);
         else if (key == "fovscale") c.fovScale = std::clamp((float)atof(val.c_str()), 0.5f, 1.5f);
+        else if (key == "texturelodbias") c.textureLodBias = std::clamp((float)atof(val.c_str()), -3.0f, 1.0f);
+        else if (key == "lumasharpen") c.lumaSharpen = std::clamp((float)atof(val.c_str()), 0.0f, 5.0f);
         else if (key == "renderscale") c.renderScale = std::clamp((float)atof(val.c_str()), 0.0f, 3.0f);
         else if (key == "renderwidth") c.renderWidth = std::clamp(atoi(val.c_str()), 0, 8192);
         else if (key == "foveatedrendering") c.foveatedRendering = ParseBool(val);
@@ -237,15 +298,22 @@ void LoadConfig() {
     }
 
     ApplyDlssGhostingFix();
-    LOG("Config: DlssGhostingFix=%d", g_config.dlssGhostingFix);
+    if (devEffectHistory >= 0) g_config.perEyeEffectHistory = devEffectHistory != 0;
+    if (devFsr >= 0) g_config.perEyeFsr = devFsr != 0;
+    if (devNoise >= 0) g_config.stereoNoiseSync = devNoise != 0;
+    if (devObjMotion >= 0) g_config.perEyeObjectMotion = devObjMotion != 0;
+    LOG("Config: DlssGhostingFix=%d (per-eye effect history %d, per-eye FSR %d)", g_config.dlssGhostingFix,
+        g_config.perEyeEffectHistory, g_config.perEyeFsr);
     LOG("Config: Enabled=%d ScreenDistance=%.2f ScreenWidth=%.2f ScreenVerticalOffset=%.2f RecenterKey=0x%X "
         "LoadAsiPlugins=%d ChainLoad=%zu VerboseLog=%d",
         g_config.enabled, g_config.screenDistance, g_config.screenWidth, g_config.screenVerticalOffset,
         g_config.recenterKey, g_config.loadAsiPlugins, g_config.chainLoad.size(), g_config.verboseLog);
-    static const char* kModes[] = {"Flat", "Mono", "Native"};
+    static const char* kModes[] = {"Flat", "Mono", "Native", "Warp"};
     LOG("Config: VROutput=%d VRMode=%s PositionTracking=%d WorldScale=%.2f PoseLatencyFrames=%d FovScale=%.2f",
         g_config.vrOutput, kModes[g_config.vrMode], g_config.positionTracking, g_config.worldScale, g_config.poseLatencyFrames,
         g_config.fovScale);
+    LOG("Config: LumaSharpen=%.2f TextureLodBias=%.2f FoveatedDlss=%d FoveatedDlssSize=%.2f", g_config.lumaSharpen,
+        g_config.textureLodBias, g_config.foveatedDlss, g_config.foveatedDlssSize);
     LOG("Config: RenderScale=%.2f RenderWidth=%d RenderHeight=%d PerEyeDlss=%d", g_config.renderScale, g_config.renderWidth,
         g_config.renderHeight, g_config.perEyeDlss);
     LOG("Config: FoveatedRendering=%d FoveatedInner=%.2f FoveatedMiddle=%.2f FoveatedOuterRate=%s FoveatedGaze=%d",

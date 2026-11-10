@@ -14,5 +14,8 @@ void OnDevice(ID3D12Device* device, ID3D12CommandQueue* queue);  // hooks Create
 void OnSwapChainSize(unsigned w, unsigned h);
 void SetBackBuffer(ID3D12Resource* const* buffers, unsigned count);  // never foveate the swap chain
 const char* Status();
+// Gaze of the eye being rendered as an NDC offset (-1..1, y up) for a viewport of this aspect; false without eye
+// tracking (or FoveatedGaze off).
+bool GazeForCurrentEye(float vpAspect, float* gx, float* gy);
 
 }  // namespace vrs

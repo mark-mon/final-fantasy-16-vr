@@ -163,6 +163,8 @@ bool ApplyBytePatch(const Module& m, const BytePatch& p) {
 //   C1 E8 0A   shr eax, 0x0A
 // We divert those 6 bytes to a stub that clears the cinematic mode bits first:
 //   if (cl & 0x1B) cl = 3;
+volatile uint32_t* g_postModeWord = nullptr;
+
 bool ApplyCinematicEffectsPatch(const Module& m) {
     const char* name = "DisableCinematicEffects";
     int count = 0;
@@ -183,7 +185,11 @@ bool ApplyCinematicEffectsPatch(const Module& m) {
         return false;
     }
     uint8_t* back = site + sizeof(stolen);
+    // The cave's last 8 bytes keep the game's flags word before our change (cinematic.cpp reads it).
+    uint32_t* seen = reinterpret_cast<uint32_t*>(cave + 56);
+    *seen = 0xFFFFFFFFu;
     uint8_t stub[] = {
+        0x89, 0x0D, 0, 0, 0, 0,              // mov [rip+rel], ecx    (the flags word as the game made it)
         0xF6, 0xC1, 0x1B,                    // test cl, 0x1B
         0x74, 0x02,                          // jz +2
         0xB1, 0x03,                          // mov cl, 3
@@ -193,6 +199,14 @@ bool ApplyCinematicEffectsPatch(const Module& m) {
         0, 0, 0, 0, 0, 0, 0, 0               // absolute return address
     };
     memcpy(stub + sizeof(stub) - 8, &back, 8);
+    {
+        const int32_t r = (int32_t)(reinterpret_cast<uint8_t*>(seen) - (cave + 6));
+        memcpy(stub + 2, &r, 4);
+    }
+    if (!vr::g_config.disableCinematicEffects) {  // only watching: leave the flags word as it is
+        stub[6] = stub[7] = stub[8] = stub[9] = stub[10] = stub[11] = stub[12] = 0x90;
+    }
+    static_assert(sizeof(stub) <= 56, "stub overlaps the saved word");
     memcpy(cave, stub, sizeof(stub));
     FlushInstructionCache(GetCurrentProcess(), cave, sizeof(stub));
 
@@ -204,6 +218,7 @@ bool ApplyCinematicEffectsPatch(const Module& m) {
         return false;
     }
     LOG("Patch %-28s applied at ffxvi.exe+0x%llX (stub %p)", name, (unsigned long long)(site - m.base), cave);
+    g_postModeWord = seen;
     return true;
 }
 
@@ -238,8 +253,9 @@ void ApplyGamePatches() {
         else LOG("Patch %-28s disabled in config.txt", p.name);
     }
 
-    if (c.disableCinematicEffects) ApplyCinematicEffectsPatch(m);
-    else LOG("Patch %-28s disabled in config.txt", "DisableCinematicEffects");
+    // Always installed: with DisableCinematicEffects off it only records the post-process flags word (cinematic.cpp).
+    ApplyCinematicEffectsPatch(m);
+    if (!c.disableCinematicEffects) LOG("Patch %-28s disabled in config.txt (flags word watched only)", "DisableCinematicEffects");
 }
 
 }  // namespace patches
@@ -251,6 +267,7 @@ uint8_t* FindCode(const char* pattern, int* count) {
     return FindUnique(m, pattern, count);
 }
 uint8_t* GameBase() { return GetGameModule().base; }
+uint32_t PostModeWord() { return g_postModeWord ? *g_postModeWord : 0xFFFFFFFFu; }
 bool WriteCodeBytes(uint8_t* dst, const void* src, size_t len) { return WriteCode(dst, src, len); }
 uint8_t* AllocCodeNear(uint8_t* nearAddr, size_t size) { return AllocNear(nearAddr, size); }
 }  // namespace patches
