@@ -430,8 +430,8 @@ void OnPresent() {
         if (v.ok) snprintf(vram, sizeof(vram), "VRAM %.2f / %.2f GB, %.2f GB in system memory", v.localUsed, v.localBudget, v.sharedUsed);
         fovdlss::Report();
         LOG("Perf: %.1f game presents/s, VR %u fps, render %d x %d, %s, VRS %s, %s, %s, %s, %s, %s, %s, %s, %s | last 10 s: %ld ResizeBuffers, %ld window "
-            "resizes, %ld XR swapchain creates, %ld stereo switches", s_presents * 1000.f / (now - s_perfT0),
-            xr::VrFramesPerSecond(), cur.w, cur.h, vram, vrs::Status(), motion_blur::Status(), taa::Status(), cam_prev::Status(), eye_history::Status(), ffx_hooks::Status(), lod_bias::Status(), warp::Status(), mvfix::Status(), rb, wr, xc, sw);
+            "resizes, %ld XR swapchain creates, %ld stereo switches | %s local", s_presents * 1000.f / (now - s_perfT0),
+            xr::VrFramesPerSecond(), cur.w, cur.h, vram, vrs::Status(), motion_blur::Status(), taa::Status(), cam_prev::Status(), eye_history::Status(), ffx_hooks::Status(), lod_bias::Status(), warp::Status(), mvfix::Status(), rb, wr, xc, sw, vr::WallClock());
         if (v.ok && v.localUsed > v.localBudget)
             LOG("WARNING: video memory over budget (%.2f of %.2f GB): lower RenderScale", v.localUsed, v.localBudget);
         if (xc >= 20 || sw >= 20)

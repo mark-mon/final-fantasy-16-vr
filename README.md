@@ -4,7 +4,7 @@ A VR mod for the PC version of **Final Fantasy XVI**. It renders the game in ful
 OpenXR (SteamVR), puts the HUD and menus on panels in front of you, and fixes the image problems that come from
 rendering a game twice per frame.
 
-**Version 0.9.2 (beta).**
+**Version 0.9.3 (beta).**
 
 ## Features
 
@@ -57,6 +57,8 @@ If you use other mods that ship their own `dinput8.dll` (ASI loaders), see `Load
 - **Upscaling:** DLSS or FSR 3. With the ghosting fix (default) DLSS Performance and Ultra Performance are both
   usable; FSR 3 Performance works well too.
 - **Motion blur:** Off. The mod keeps it off after loads.
+- **Dynamic resolution:** off. With DLSS the mod holds the render size fixed anyway (`DisableDynamicResolution` in
+  `config.txt`, on by default); with FSR 3 it can't, so turn it off in the game's graphics settings.
 - **Frame rate limit:** unlimited or the highest setting. The headset paces the game.
 
 ## Controls
@@ -89,6 +91,20 @@ missing). The main ones:
 `config.txt` only (no menu entry): `PositionTracking` (1), `PoseLatencyFrames` (1), `DisableMotionBlur` (1) and the
 start-up patches' details.
 
+## What's new in 0.9.3
+
+Stability release: fixes the likely causes of the bluescreens (0x139) some players saw with 0.9.2.
+
+- GPU textures the mod replaces while the game runs (on resolution changes) are now freed only after the GPU is done
+  with them (5 s and 30 frames later). Freeing them immediately could crash the graphics driver.
+- Foveated DLSS: when the game recreates its DLSS feature, the mod now frees the centre feature and textures it kept
+  for it (several hundred MB each time were never freed before). The centre size no longer changes by a pixel or
+  two with the render size, which rebuilt the centre DLSS feature dozens of times a second with dynamic resolution.
+- Dynamic resolution with DLSS: the render size is held fixed at DLSS Performance (50 %), or at your quality mode's
+  size if that is lower. Without dynamic resolution nothing changes. `DisableDynamicResolution = 0` in `config.txt`
+  restores the game's behaviour.
+- `ff16vr.log` now records the time of day (at start and on every periodic line), so a log can be matched to a crash.
+
 ## What's new in 0.9.2
 
 - The DLSS / FSR 3 ghosting fix is complete and on by default: each eye's upscaler now gets motion vectors rebuilt
@@ -114,7 +130,8 @@ start-up patches' details.
 
 The mod writes `ff16vr.log` in the game folder. If something goes wrong, turn on "Verbose log" (Game page of the mod
 menu, or `VerboseLog = 1` in `config.txt`), reproduce the problem, and include the log with your report. The log is
-replaced each time the game starts.
+replaced each time the game starts (the previous one is kept as `ff16vr.prev.log`). If Windows shows a bluescreen,
+please also include the files from `C:\Windows\Minidump`.
 
 ## Building from source
 

@@ -30,6 +30,7 @@
 #include "stereo_render.h"
 
 namespace ffx_hooks {
+std::atomic<long> g_sizeChanges{0};   // render-size changes between dispatches (dynamic resolution)
 namespace {
 
 struct Header {
@@ -153,6 +154,7 @@ bool DescInputs(const Header* desc, stereo_edge::Inputs* out, ID3D12GraphicsComm
     ID3D12Resource* mv = res(120);
     auto* cl = *reinterpret_cast<ID3D12GraphicsCommandList* const*>(b + 16);
     const uint32_t rw = u32(376), rh = u32(380);
+    { static uint32_t s_lw = 0, s_lh = 0; if (rw != s_lw || rh != s_lh) { if (s_lw) g_sizeChanges++; s_lw = rw; s_lh = rh; } }
     const D3D12_RESOURCE_STATES ds = FfxState(u32(72 + 40)), ms = FfxState(u32(120 + 40));
     static int s_logs = 0;
     if (s_logs++ < 2)
@@ -287,8 +289,9 @@ void Install() {
 bool FsrEvaluatingRecently() { return GetTickCount64() - g_lastEval.load() < 500; }
 
 const char* Status() {
-    static char buf[256];
-    snprintf(buf, sizeof(buf), "FSR per eye: %ld / %ld upscales, %ld rebuilt; %s", g_evals[0].load(), g_evals[1].load(), g_rebuilt.load(),
+    static char buf[320];
+    snprintf(buf, sizeof(buf), "FSR per eye: %ld / %ld upscales, %ld rebuilt, render size changed %ld times%s; %s", g_evals[0].load(),
+             g_evals[1].load(), g_rebuilt.load(), g_sizeChanges.load(), g_sizeChanges.load() > 20 ? " (dynamic resolution on?)" : "",
              cam_prev::JitterMatchStatus());
     return buf;
 }

@@ -60,6 +60,8 @@ static thread_local int t_eye = -1;
 static std::atomic<unsigned> g_lastRW{0}, g_lastRH{0};
 bool LastRenderSize(unsigned& w, unsigned& h) { w = g_lastRW.load(); h = g_lastRH.load(); return w && h; }
 static std::atomic<uint64_t> s_eval{0}, s_cropped{0}, s_skipped{0}, s_moved{0};
+static std::atomic<uint64_t> s_sizeChanges{0}, s_centreCreates{0}, s_viewsFreed{0};
+static unsigned g_lastCropW = 0, g_lastCropH = 0;   // render-size changes (dynamic resolution) seen by the centre crop
 static std::atomic<bool> g_logged{false};
 
 static const unsigned kSR = 1;              // NVSDK_NGX_Feature_SuperSampling
@@ -102,12 +104,15 @@ static const char* kInBase[][2] = {
 // take a smaller Width/Height + OutWidth/OutHeight than it was created with.
 struct View { ID3D12Resource* out = nullptr; UINT w = 0, h = 0; DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
               NgxHandle* priv = nullptr; unsigned pcw = 0, pch = 0; bool failed = false;
+              unsigned pow = 0, poh = 0; bool exactOnly = true;    // priv's output size; exactOnly: one feature per crop size
+              // (a 1:1 feature evaluated with a smaller subrect was refused with BAD00005 on the test PC, runs 334/335;
+              // false re-enables that attempt, with a fallback to exact size)
               ID3D12Resource* pout = nullptr; NgxHandle* ph = nullptr; unsigned pw = 0, phh = 0; bool pfailed = false; unsigned ppreset = 0;
               unsigned cpreset = 0;
               ID3D12Resource* hist[2] = {}; unsigned hw = 0, hh = 0, hcur = 0; uint64_t hframe = 0;
               ID3D12Resource* mvc = nullptr; unsigned mvw = 0, mvh = 0; int pbx = -1, pby = -1; };   // moving crop: own MV crop, previous base   // periphery TAA history (output size)   // periphery: preset E DLAA at render size   // priv: our own DLSS feature sized for the crop
 typedef unsigned(__cdecl* PFN_Release)(NgxHandle*);
-static PFN_Release p_Release;
+static PFN_Release p_Release;   // the original (trampoline once hooked): used for our own features
 static std::unordered_map<unsigned, View> g_views;
 
 // Deferred release (user 2026-11-05: two bluescreens, both while changing the centre size in game). Our textures and NGX
@@ -438,12 +443,18 @@ static unsigned Evaluate(PFN_Eval orig, ID3D12GraphicsCommandList* cl, const Ngx
     ID3D12Resource* gameOut = nullptr;
     if (!Ok(p->Get("Output", &gameOut)) || !gameOut || !outW || !outH || !rw || !rh) { s_skipped++; return orig(cl, h, p, cb); }
     const float sx = (float)outW / rw, sy = (float)outH / rh;
-    unsigned cw = std::max(16u, (unsigned)(rw * std::clamp(cfg.width, 0.1f, 1.0f)) & ~1u);
-    unsigned ch = std::max(16u, (unsigned)(rh * std::clamp(cfg.height, 0.1f, 1.0f)) & ~1u);
+    // The centre's OUTPUT size is a fixed share of the game's output, so dynamic resolution (render size changing every
+    // few frames) never changes it; the crop in render pixels follows the render size. Before 0.9.3 the output was
+    // derived from the crop and wobbled by 1-2 px, which recreated the centre DLSS feature dozens of times a second
+    // (player's 0x139 bluescreens, 2026-11-12).
+    const unsigned ow = std::min(outW, std::max(16u, (unsigned)std::lround(outW * std::clamp(cfg.width, 0.1f, 1.0f)) & ~1u));
+    const unsigned oh = std::min(outH, std::max(16u, (unsigned)std::lround(outH * std::clamp(cfg.height, 0.1f, 1.0f)) & ~1u));
+    unsigned cw = std::min(rw, std::max(16u, (unsigned)std::lround(ow / sx) & ~1u));
+    unsigned ch = std::min(rh, std::max(16u, (unsigned)std::lround(oh / sy) & ~1u));
     int bx = (int)std::lround(c[0] * rw - cw * 0.5f), by = (int)std::lround(c[1] * rh - ch * 0.5f);
     bx = std::clamp(bx, 0, (int)(rw - cw)); by = std::clamp(by, 0, (int)(rh - ch));
-    const unsigned ow = (unsigned)std::lround(cw * sx), oh = (unsigned)std::lround(ch * sy);
-    const unsigned obx = (unsigned)std::lround(bx * sx), oby = (unsigned)std::lround(by * sy);
+    const unsigned obx = std::min((unsigned)std::lround(bx * sx), outW - ow), oby = std::min((unsigned)std::lround(by * sy), outH - oh);
+    if (cw != g_lastCropW || ch != g_lastCropH) { if (g_lastCropW) s_sizeChanges++; g_lastCropW = cw; g_lastCropH = ch; }
     ID3D12Resource* periph = cfg.periphDlss && rw == inW && rh == inH ? Periphery(orig, cl, h, p, cb, gameOut, rw, rh, outW, outH, flags) : nullptr;
     ID3D12Resource* priv = nullptr;
     { std::lock_guard<std::mutex> l(g_mu); priv = PrivateOut(cl, h->id, gameOut, ow, oh); }
@@ -476,7 +487,9 @@ static unsigned Evaluate(PFN_Eval orig, ID3D12GraphicsCommandList* cl, const Ngx
             float dpx = (float)(bx - pbx) * (mvLow ? 1.0f : sx), dpy = (float)(by - pby) * (mvLow ? 1.0f : sy);
             {
                 std::lock_guard<std::mutex> l(g_mu); View& v = g_views[h->id];
-                if (!v.mvc || v.mvw != mw || v.mvh != mh) { DeferRes(v.mvc); v.mvc = MakeTex(cl, gameMv, mw, mh); v.mvw = mw; v.mvh = mh; }
+                if (!v.mvc || v.mvw < mw || v.mvh < mh) {   // allocated at the largest size: dynamic resolution only shrinks the used part
+                    const unsigned aw = std::max(mw, ow), ah = std::max(mh, oh);
+                    DeferRes(v.mvc); v.mvc = MakeTex(cl, gameMv, aw, ah); v.mvw = aw; v.mvh = ah; }
                 mvCrop = v.mvc;
             }
             if (mvCrop && MvShift(cl, gameMv, mvCrop, saved[4][0] + (mvLow ? bx : obx), saved[4][1] + (mvLow ? by : oby), mw, mh,
@@ -497,25 +510,45 @@ static unsigned Evaluate(PFN_Eval orig, ID3D12GraphicsCommandList* cl, const Ngx
     {
         std::lock_guard<std::mutex> l(g_mu);
         View& v = g_views[h->id];
-        if (v.priv && (v.pcw != cw || v.pch != ch || v.cpreset != cfg.centrePreset)) { DeferNgx(v.priv); v.priv = nullptr; v.failed = false; }
-        if (!v.priv && !(v.failed && v.pcw == cw && v.pch == ch)) {
+        // Created once for the LARGEST crop (the output size, input 1:1) and evaluated with the current crop as the
+        // render subrect: dynamic resolution changes only the subrect (how DLSS itself expects dynamic resolution).
+        // If the driver refuses a smaller subrect, this view falls back to features of the exact crop size.
+        const unsigned mw2 = v.exactOnly ? cw : ow, mh2 = v.exactOnly ? ch : oh;
+        const bool stale = v.priv && (v.cpreset != cfg.centrePreset || v.pow != ow || v.poh != oh ||
+                                      (v.exactOnly ? (v.pcw != cw || v.pch != ch) : (v.pcw < cw || v.pch < ch)));
+        if (stale) { DeferNgx(v.priv); v.priv = nullptr; v.failed = false; }
+        if (!v.priv && !(v.failed && v.pcw == mw2 && v.pch == mh2)) {
+            p->Set("Width", mw2); p->Set("Height", mh2);   // creation size; the evaluate below uses cw x ch
             unsigned gameFlags = g_flags[h->id], gameQ = g_quality[h->id];
             p->Set("DLSS.Feature.Create.Flags", (int)gameFlags); p->Set("PerfQualityValue", (int)gameQ);
             unsigned oldP[6];
             for (int i = 0; i < 6; i++) { oldP[i] = GetUI(p, kPresetKeys[i]); if (cfg.centrePreset) p->Set(kPresetKeys[i], cfg.centrePreset); }
             unsigned cr = o_Create(cl, kSR, p, &v.priv);
+            p->Set("Width", cw); p->Set("Height", ch);
+            s_centreCreates++;
             for (int i = 0; i < 6; i++) p->Set(kPresetKeys[i], oldP[i]);
             v.cpreset = cfg.centrePreset;
             LOGI("fovdlss: centre preset %u", cfg.centrePreset);
-            LOGI("fovdlss: centre DLSS feature for handle %u: %ux%u -> %ux%u, result %08X", h->id, cw, ch, ow, oh, cr);
+            LOG("fovdlss: centre DLSS feature for handle %u: created for %ux%u -> %ux%u (crop now %ux%u%s), result %08X", h->id, mw2, mh2, ow, oh,
+                cw, ch, v.exactOnly ? ", exact size" : "", cr);
             if (!Ok(cr)) v.priv = nullptr;
             v.failed = !v.priv;
-            v.pcw = cw; v.pch = ch;
+            v.pcw = mw2; v.pch = mh2; v.pow = ow; v.poh = oh;
         }
         ph = v.priv;
     }
     if (!ph) { restore(); s_skipped++; return orig(cl, h, p, cb); }   // no centre feature: the game's full DLSS
     unsigned r = orig(cl, ph, p, cb);
+    if (!Ok(r)) {
+        bool retry = false;
+        { std::lock_guard<std::mutex> l(g_mu); View& v = g_views[h->id];
+          if (!v.exactOnly && (v.pcw != cw || v.pch != ch)) { v.exactOnly = true; retry = true; } }
+        if (retry) {   // smaller subrect refused: this frame gets the game's full DLSS, later frames exact-size features
+            LOG("fovdlss: centre evaluate with a %ux%u subrect of a %ux%u feature failed (%08X): handle %u uses exact-size features", cw, ch, ow, oh, r, h->id);
+            if (mvCrop) Barrier(cl, mvCrop, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+            restore(); s_skipped++; return orig(cl, h, p, cb);
+        }
+    }
     if (mvCrop) Barrier(cl, mvCrop, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     // composite: centre + upscaled periphery into the game's output (UAV state around the NGX evaluate)
     if (Ok(r)) {
@@ -588,6 +621,28 @@ static unsigned Evaluate(PFN_Eval orig, ID3D12GraphicsCommandList* cl, const Ngx
     return r;
 }
 static unsigned __cdecl Hk_Eval(ID3D12GraphicsCommandList* cl, const NgxHandle* h, NgxParam* p, void* cb) { return Evaluate(o_Eval, cl, h, p, cb); }
+
+// The game (Streamline) releases one of its features: everything we keep for it (our centre / periphery features, the
+// centre output, history and MV textures) goes to the deferred queue. Before 0.9.3 it was never freed: with a game that
+// recreates its DLSS feature often (dynamic resolution, settings changes) that leaked hundreds of MB each time.
+static unsigned __cdecl Hk_Release(NgxHandle* h) {
+    if (h) {
+        View dead; bool had = false;
+        {
+            std::lock_guard<std::mutex> l(g_mu);
+            auto it = g_views.find(h->id);
+            if (it != g_views.end()) { dead = it->second; g_views.erase(it); had = true; }
+            g_feature.erase(h->id); g_flags.erase(h->id); g_quality.erase(h->id); g_createOutW.erase(h->id); g_createOutH.erase(h->id);
+        }
+        if (had) {
+            DeferNgx(dead.priv); DeferNgx(dead.ph);
+            DeferRes(dead.out); DeferRes(dead.pout); DeferRes(dead.hist[0]); DeferRes(dead.hist[1]); DeferRes(dead.mvc);
+            s_viewsFreed++;
+            LOG("fovdlss: game released DLSS handle %u: its centre feature and textures are released after 5 s", h->id);
+        }
+    }
+    return p_Release ? p_Release(h) : 0;
+}
 static unsigned __cdecl Hk_EvalC(ID3D12GraphicsCommandList* cl, const NgxHandle* h, NgxParam* p, void* cb) { return Evaluate(o_EvalC, cl, h, p, cb); }
 
 static DWORD WINAPI InstallThread(void*) {
@@ -599,7 +654,14 @@ static DWORD WINAPI InstallThread(void*) {
         {"NVSDK_NGX_D3D12_EvaluateFeature", (void*)Hk_Eval, (void**)&o_Eval},
         {"NVSDK_NGX_D3D12_EvaluateFeature_C", (void*)Hk_EvalC, (void**)&o_EvalC},
     };
-    p_Release = (PFN_Release)GetProcAddress(m, "NVSDK_NGX_D3D12_ReleaseFeature");
+    {
+        void* t = (void*)GetProcAddress(m, "NVSDK_NGX_D3D12_ReleaseFeature");
+        void* tramp = nullptr;
+        MH_STATUS st = t ? MH_CreateHook(t, (void*)Hk_Release, &tramp) : MH_ERROR_FUNCTION_NOT_FOUND;
+        if (st == MH_OK) { p_Release = (PFN_Release)tramp; st = MH_EnableHook(t); }
+        else p_Release = (PFN_Release)t;
+        LOGI("fovdlss: NVSDK_NGX_D3D12_ReleaseFeature %s", st == MH_OK ? "hooked" : "not hooked");
+    }
     for (auto& x : hs) {
         void* t = (void*)GetProcAddress(m, x.n);
         MH_STATUS st = t ? MH_CreateHook(t, x.d, x.o) : MH_ERROR_FUNCTION_NOT_FOUND;
@@ -614,8 +676,13 @@ void Report() {
     uint64_t e = s_eval.exchange(0), c = s_cropped.exchange(0), k = s_skipped.exchange(0);
     uint64_t mv = s_moved.exchange(0);
     float c0[2], c1[2]; { std::lock_guard<std::mutex> l(g_mu); c0[0] = g_center[0][0]; c0[1] = g_center[0][1]; c1[0] = g_center[1][0]; c1[1] = g_center[1][1]; }
+    const uint64_t sc = s_sizeChanges.exchange(0), cc = s_centreCreates.exchange(0), vf = s_viewsFreed.exchange(0);
+    size_t pending = 0; { std::lock_guard<std::mutex> l(g_deadMu); pending = g_dead.size(); }
     if (e) LOGI("fovdlss: %llu NGX evaluates, %llu cropped to the centre (%llu with a moved centre), %llu not DLSS-SR | centre L (%.2f %.2f) R (%.2f %.2f) (10 s)",
                 (unsigned long long)e, (unsigned long long)c, (unsigned long long)mv, (unsigned long long)k, c0[0], c0[1], c1[0], c1[1]);
+    if (sc || cc || vf)
+        LOG("fovdlss: render size changed %llu times (dynamic resolution?), %llu centre features created, %llu game handles released, %zu objects waiting for release (10 s)",
+            (unsigned long long)sc, (unsigned long long)cc, (unsigned long long)vf, pending);
 }
 
 }  // namespace fovdlss

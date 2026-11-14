@@ -12,6 +12,7 @@
 //
 // The pass records into the game's command list, so the compute state it changes (descriptor heaps, root signature,
 // root arguments, pipeline) is tracked per command list and put back afterwards.
+#include "gpu_retire.h"
 #include "stereo_edge.h"
 
 #include <windows.h>
@@ -292,7 +293,7 @@ ID3D12Resource* OutFor(int eye, const D3D12_RESOURCE_DESC& mvDesc) {
     d.MipLevels = 1;
     d.DepthOrArraySize = 1;
     if (o.tex && o.desc.Width == d.Width && o.desc.Height == d.Height && o.desc.Format == d.Format) return o.tex;
-    if (o.tex) o.tex->Release();  // only on a resolution change (the GPU may still use it: rare, accepted for a test option)
+    gpu_retire::Defer(o.tex);  // resolution change: queued frames may still use it
     o = OutTex{};
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
     if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE |

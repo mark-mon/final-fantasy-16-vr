@@ -18,6 +18,7 @@
 #include "watch.h"
 #include "vrs.h"
 #include "config.h"
+#include "gpu_retire.h"
 
 namespace hooks {
 
@@ -88,7 +89,7 @@ static T* UnwrapStreamline(T* obj) {
 }
 
 static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT sync, UINT flags) {
-    if (t_presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) { frame_probe::OnPresent(); render_size::OnPresent(); mem_scan::OnPresent(); watch::OnPresent(); hud::BeforeVr(); if (vr::g_config.vrOutput) xr::OnPresent(sc); hud::AfterVr(sc); }
+    if (t_presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) { frame_probe::OnPresent(); gpu_retire::OnPresent(); render_size::OnPresent(); mem_scan::OnPresent(); watch::OnPresent(); hud::BeforeVr(); if (vr::g_config.vrOutput) xr::OnPresent(sc); hud::AfterVr(sc); }
     const bool outer = t_presentDepth == 1 && !(flags & DXGI_PRESENT_TEST);
     if (outer) stereo_render::OnPresentBegin();
     if (outer && stereo_render::SkipThisPresent()) {
@@ -103,7 +104,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(IDXGISwapChain* sc, UINT sync, UIN
 
 static HRESULT STDMETHODCALLTYPE Hook_Present1(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                                const DXGI_PRESENT_PARAMETERS* params) {
-    if (t_presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) { frame_probe::OnPresent(); render_size::OnPresent(); mem_scan::OnPresent(); watch::OnPresent(); hud::BeforeVr(); if (vr::g_config.vrOutput) xr::OnPresent(sc); hud::AfterVr(sc); }
+    if (t_presentDepth++ == 0 && !(flags & DXGI_PRESENT_TEST)) { frame_probe::OnPresent(); gpu_retire::OnPresent(); render_size::OnPresent(); mem_scan::OnPresent(); watch::OnPresent(); hud::BeforeVr(); if (vr::g_config.vrOutput) xr::OnPresent(sc); hud::AfterVr(sc); }
     const bool outer = t_presentDepth == 1 && !(flags & DXGI_PRESENT_TEST);
     if (outer) stereo_render::OnPresentBegin();
     if (outer && stereo_render::SkipThisPresent()) {

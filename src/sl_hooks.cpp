@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstring>
@@ -539,18 +540,34 @@ SlResult Hk_DLSSSetOptions(const SlViewport& vp, const void* options_) {
 
 using DLSSGetOptimal_t = SlResult (*)(const void* options, void* settings);
 DLSSGetOptimal_t o_DLSSGetOptimal = nullptr;
-// DLSSOptimalSettings: base 32, optimalRenderWidth 32, optimalRenderHeight 36
+// DLSSOptimalSettings (sl_dlss.h): base 32, optimalRenderWidth 32, optimalRenderHeight 36, optimalSharpness 40,
+// renderWidthMin 44, renderHeightMin 48, renderWidthMax 52, renderHeightMax 56 - the dynamic-resolution range.
 SlResult Hk_DLSSGetOptimal(const void* options, void* settings) {
     SlResult r = o_DLSSGetOptimal(options, settings);
     if (options && settings) {
         const auto* o = static_cast<const uint8_t*>(options);
-        const auto* st = static_cast<const uint8_t*>(settings);
+        auto* st = static_cast<uint8_t*>(settings);
+        auto u = [&](int off) -> uint32_t& { return *reinterpret_cast<uint32_t*>(st + off); };
+        const uint32_t minW = u(44), minH = u(48), maxW = u(52), maxH = u(56);
+        const bool pin = r == 0 && vr::g_config.disableDynamicResolution && u(32) && u(36);
+        if (pin) {
+            // A game with dynamic resolution OFF uses only the optimal size (left alone: the player's quality mode).
+            // With it ON the game moves between min and max: pin both to DLSS Performance (50 % of the output), or to
+            // the chosen mode's size if that is already lower (Ultra Performance), so dynamic resolution becomes one
+            // fixed, cheap size instead of a size that changes every few frames.
+            const uint32_t outW = *reinterpret_cast<const uint32_t*>(o + 36), outH = *reinterpret_cast<const uint32_t*>(o + 40);
+            uint32_t pw = u(32), ph = u(36);
+            if (outW && outH && (outW + 1) / 2 < pw) { pw = (outW + 1) / 2; ph = (outH + 1) / 2; }
+            if (minW && maxW && minW <= maxW) pw = std::clamp(pw, minW, maxW);
+            if (minH && maxH && minH <= maxH) ph = std::clamp(ph, minH, maxH);
+            u(44) = u(52) = pw; u(48) = u(56) = ph;
+        }
         static int s_n = 0;
-        if (s_n++ < 40)
-            LOG("SL: DLSS optimal settings for mode %u output %u x %u -> render %u x %u (result %d); from%s",
+        if (s_n++ < 12)
+            LOG("SL: DLSS optimal settings for mode %u output %u x %u -> render %u x %u, dynamic range %u x %u .. %u x %u%s %u x %u (result %d); from%s",
                 *reinterpret_cast<const uint32_t*>(o + 32), *reinterpret_cast<const uint32_t*>(o + 36),
-                *reinterpret_cast<const uint32_t*>(o + 40), *reinterpret_cast<const uint32_t*>(st + 32),
-                *reinterpret_cast<const uint32_t*>(st + 36), r, GameStack().c_str());
+                *reinterpret_cast<const uint32_t*>(o + 40), u(32), u(36), minW, minH, maxW, maxH,
+                pin ? " -> range pinned to" : ", unchanged", u(44), u(48), r, GameStack().c_str());
     }
     return r;
 }

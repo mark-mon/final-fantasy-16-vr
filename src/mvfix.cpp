@@ -30,6 +30,7 @@
 #include <mutex>
 
 #include "cam_prev.h"
+#include "gpu_retire.h"
 #include "vr_shared.h"
 #include "config.h"
 #include "log.h"
@@ -257,7 +258,7 @@ bool EnsureRes(int eye, const D3D12_RESOURCE_DESC& md, UINT ew, UINT eh) {
     const DXGI_FORMAT fmt = SrvFormat(md.Format);
     if (r.out && r.w == md.Width && r.h == md.Height && r.fmt == fmt && r.ew == ew && r.eh == eh) return true;
     for (ID3D12Resource** t : {&r.out, &r.obj, &r.depth})
-        if (*t) (*t)->Release(), *t = nullptr;  // on a resolution change only (the GPU may still read it: accepted)
+        gpu_retire::Defer(*t), *t = nullptr;  // resolution change: queued frames may still use them (0x139 bluescreens)
     r.haveCur = false;
     r.out = MakeTex(md.Width, md.Height, fmt, L"ff16vr motion rebuild");
     r.obj = MakeTex(ew, eh, DXGI_FORMAT_R16G16_FLOAT, L"ff16vr motion rebuild object part");

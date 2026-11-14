@@ -50,6 +50,8 @@ struct Config {
     // dev (test PC, fixed headset): simulated head motion added to the tracked pose, so paths that only matter when
     // the head moves between frames get exercised. Amplitude in metres and degrees, period in seconds.
     float devHeadSwayM = 0, devHeadSwayDeg = 0, devHeadSwayPeriod = 4;
+    bool disableDynamicResolution = true;   // DLSS: pin the render size (Streamline min = max = optimal): dynamic resolution
+                                            // made the mod rebuild GPU objects constantly (0x139 bluescreens, 2026-11)
     bool devNoDlss = false;   // dev (test PC): report DLSS as unsupported to the game, so it falls back to FSR 3 (the
                               // game's config.xml does not switch the upscaler by itself, run 312)
     bool devCapture = false;  // dev: capture depth / motion vectors / camera per eye in plain Native (dumps with shots)

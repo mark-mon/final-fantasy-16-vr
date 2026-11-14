@@ -48,6 +48,10 @@ static const char* kDefaultConfig =
     "# same jitter for both eyes, motion vectors rebuilt by the mod). Removes the halo around characters and the\n"
     "# one-eye noise when moving the head. 1 = on (default since 0.9.2; the old DlssGhostingFix key is ignored).\n"
     "DlssGhostingFixV2 = 1\n"
+    "# Keep the render resolution fixed even if the game's dynamic resolution is on (DLSS). Resolution changes while\n"
+    "# frames are in flight have been linked to driver crashes (bluescreens) in VR; also turn dynamic resolution off\n"
+    "# in the game's graphics settings. 1 = on (default).\n"
+    "DisableDynamicResolution = 1\n"
     "# DLSS model: Default (the game's / driver's choice), K (transformer, best quality), M (transformer, faster),\n"
     "# L (transformer, for Ultra Performance), J\n"
     "DlssPreset = Default\n"
@@ -225,6 +229,7 @@ void LoadConfig() {
         }
         else if (key == "devcapture") c.devCapture = ParseBool(val);
         else if (key == "devnodlss") c.devNoDlss = ParseBool(val);
+        else if (key == "disabledynamicresolution") c.disableDynamicResolution = ParseBool(val);
         else if (key == "devheadsway") sscanf_s(val.c_str(), "%f,%f,%f", &c.devHeadSwayM, &c.devHeadSwayDeg, &c.devHeadSwayPeriod);
         else if (key == "cinematictheater") c.cinematicTheater = ParseBool(val);
         else if (key == "warpobjects") c.warpObjects = ParseBool(val);

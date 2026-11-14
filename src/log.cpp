@@ -24,6 +24,19 @@ void LogInit(const wchar_t* path) {
     MoveFileExW(path, prev.c_str(), MOVEFILE_REPLACE_EXISTING);
     // Shared so tools (test agent, editors) can read the log while the game runs.
     g_file = _wfsopen(path, L"w", _SH_DENYNO);
+    if (g_file) {   // wall-clock time, so a log can be matched to a crash dump / Event Viewer entry
+        SYSTEMTIME lt{}, ut{}; GetLocalTime(&lt); GetSystemTime(&ut);
+        fprintf(g_file, "[%7llu.%03llu] Log started %04u-%02u-%02u %02u:%02u:%02u local (%04u-%02u-%02u %02u:%02u:%02u UTC)\n", 0ull, 0ull,
+                lt.wYear, lt.wMonth, lt.wDay, lt.wHour, lt.wMinute, lt.wSecond, ut.wYear, ut.wMonth, ut.wDay, ut.wHour, ut.wMinute, ut.wSecond);
+        fflush(g_file);
+    }
+}
+
+const char* WallClock() {   // "HH:MM:SS" local time (for periodic lines)
+    static thread_local char buf[16];
+    SYSTEMTIME lt{}; GetLocalTime(&lt);
+    snprintf(buf, sizeof(buf), "%02u:%02u:%02u", lt.wHour, lt.wMinute, lt.wSecond);
+    return buf;
 }
 
 void Log(const char* fmt, ...) {

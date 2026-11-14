@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "config.h"
+#include "gpu_retire.h"
 #include "log.h"
 #include "stereo_render.h"
 #include "vr_shared.h"
@@ -82,7 +83,8 @@ char g_status[128] = "off";
 constexpr size_t kMaxSris = 40;
 
 void ReleaseSri(Sri& e, uint64_t now) {
-    if (e.tex) g_retired.push_back({e.tex, now});  // may still be referenced by recorded command lists
+    gpu_retire::Defer(e.tex);  // may still be referenced by recorded command lists (16 ms was too short)
+    (void)now;
     if (e.upload) e.upload->Release();
     if (e.list) e.list->Release();
     if (e.alloc) e.alloc->Release();
